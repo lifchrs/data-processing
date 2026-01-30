@@ -194,7 +194,7 @@ def run_sam3d(video_path, sam3d_env, ttt3r_out, output_dir, prompt, stride, devi
     return sam3d_out
 
 
-def combine_outputs(ttt3r_out, wilor_out, output_dir, combine_env, object_dir=None, contrast=False, stride=1):
+def combine_outputs(ttt3r_out, wilor_out, output_dir, combine_env, object_dir=None, contrast=False, stride=1, no_object_transform=False, render_replaced_depth=False):
     """
     Combine TTT3R and WiLoR outputs into PLY files.
     """
@@ -207,7 +207,7 @@ def combine_outputs(ttt3r_out, wilor_out, output_dir, combine_env, object_dir=No
 
     # Build generation command
     cmd = [
-        "python", "generate_combined_ply.py",
+        "python", "pipeline/generate_combined_ply.py",
         "--ttt3r_out", ttt3r_out,
         "--wilor_out", wilor_out,
         "--output_dir", ply_out,
@@ -219,6 +219,12 @@ def combine_outputs(ttt3r_out, wilor_out, output_dir, combine_env, object_dir=No
     
     if contrast:
         cmd.append("--contrast")
+
+    if no_object_transform:
+        cmd.append("--no_object_transform")
+
+    if render_replaced_depth:
+        cmd.append("--render_replaced_depth")
 
     # If specific environment is requested
     if combine_env:
@@ -378,7 +384,17 @@ Examples:
         "--contrast",
         action="store_true",
         help="Use bright purple color for objects instead of natural colors"
-    )   
+    )
+    parser.add_argument(
+        "--no_object_transform",
+        action="store_true",
+        help="Skip object transformation in combine step - use raw SAM3D world coordinates"
+    )
+    parser.add_argument(
+        "--render_replaced_depth",
+        action="store_true",
+        help="Excise original object from scene, insert reconstruction, and render depth image"
+    )
 
     return parser.parse_args()
 
@@ -507,7 +523,9 @@ def main():
             args.combine_env,
             object_dir=sam3d_out,
             contrast=args.contrast,
-            stride=args.frame_interval
+            stride=args.frame_interval,
+            no_object_transform=args.no_object_transform,
+            render_replaced_depth=args.render_replaced_depth
         )
 
     # Final summary

@@ -6,7 +6,7 @@
 #   chmod +x setup.sh
 #   ./setup.sh
 # ──────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
@@ -78,14 +78,21 @@ else
     echo "  Downloading SAM3D checkpoints from HuggingFace..."
     echo "  NOTE: You must have access to facebook/sam-3d-objects on HuggingFace."
     echo "  Run 'huggingface-cli login' first if not already authenticated."
+    eval "$(conda shell.bash hook)"
+    conda activate sam3d-objects
     pip install 'huggingface-hub[cli]<1.0' 2>/dev/null || true
-    huggingface-cli download \
+    python -m huggingface_hub.commands.huggingface_cli download \
         --repo-type model \
-        --local-dir sam-3d-objects/checkpoints/hf-download \
+        --local-dir sam-3d-objects/checkpoints/hf \
+        --include "checkpoints/*" \
         --max-workers 1 \
         facebook/sam-3d-objects
-    mv sam-3d-objects/checkpoints/hf-download/checkpoints sam-3d-objects/checkpoints/hf
-    rm -rf sam-3d-objects/checkpoints/hf-download
+    conda deactivate
+    # HF downloads into checkpoints/ subdirectory; move files up
+    if [ -d sam-3d-objects/checkpoints/hf/checkpoints ]; then
+        mv sam-3d-objects/checkpoints/hf/checkpoints/* sam-3d-objects/checkpoints/hf/
+        rmdir sam-3d-objects/checkpoints/hf/checkpoints
+    fi
 fi
 
 # TTT3R checkpoint
@@ -93,10 +100,13 @@ if [ -f TTT3R/src/cut3r_512_dpt_4_64.pth ]; then
     echo "  TTT3R checkpoint already present, skipping."
 else
     echo "  Downloading TTT3R checkpoint..."
+    eval "$(conda shell.bash hook)"
+    conda activate ttt3r
     pip install gdown 2>/dev/null || true
     cd TTT3R/src
-    gdown --fuzzy "https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/view?usp=drive_link"
+    python -m gdown --fuzzy "https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/view?usp=drive_link"
     cd "$ROOT_DIR"
+    conda deactivate
 fi
 
 # MANO hand models

@@ -1,3 +1,6 @@
+# Legacy scripts
+pipeline/
+
 # 3D outputs
 **/*.ply
 **/*.glb

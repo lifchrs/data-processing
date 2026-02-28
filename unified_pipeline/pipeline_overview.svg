@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 820" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#555" />
+    </marker>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-opacity="0.12" />
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="820" fill="#fafbfc" rx="12" />
+
+  <!-- Title -->
+  <text x="480" y="38" text-anchor="middle" font-size="22" font-weight="700" fill="#1a1a2e">Unified 3D Reconstruction Pipeline</text>
+  <text x="480" y="58" text-anchor="middle" font-size="13" fill="#666">Video → Per-Frame 3D Point Cloud with Hands &amp; Objects</text>
+
+  <!-- ==================== INPUTS ==================== -->
+
+  <!-- Input Video -->
+  <rect x="310" y="80" width="160" height="44" rx="8" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5" filter="url(#shadow)" />
+  <text x="390" y="100" text-anchor="middle" font-size="13" font-weight="600" fill="#e65100">Input Video</text>
+  <text x="390" y="114" text-anchor="middle" font-size="10" fill="#bf360c">.mp4 / .webm</text>
+
+  <!-- VITRA Annotation -->
+  <rect x="700" y="80" width="200" height="44" rx="8" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5" filter="url(#shadow)" />
+  <text x="800" y="100" text-anchor="middle" font-size="13" font-weight="600" fill="#e65100">VITRA Annotation</text>
+  <text x="800" y="114" text-anchor="middle" font-size="10" fill="#bf360c">hand pose, joints, intrinsics</text>
+
+  <!-- ==================== PARALLEL REGION: STEPS 1 & 2 ==================== -->
+
+  <!-- Parallel bracket background -->
+  <rect x="40" y="150" width="590" height="165" rx="12" fill="none" stroke="#bbb" stroke-width="1" stroke-dasharray="6,4" />
+  <text x="335" y="168" text-anchor="middle" font-size="11" font-weight="600" fill="#888">Parallel</text>
+
+  <!-- Step 1: Scene Reconstruction (left) -->
+  <rect x="60" y="180" width="260" height="75" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.8" filter="url(#shadow)" />
+  <text x="70" y="199" font-size="10" font-weight="700" fill="#1976d2">STEP 1</text>
+  <text x="190" y="214" text-anchor="middle" font-size="14" font-weight="600" fill="#0d47a1">Scene Reconstruction</text>
+  <text x="190" y="232" text-anchor="middle" font-size="11" fill="#1565c0">TTT3R — monocular depth + SfM</text>
+  <text x="190" y="248" text-anchor="middle" font-size="10" fill="#666">~90s</text>
+
+  <!-- Step 2: Scene Segmentation (right) -->
+  <rect x="350" y="180" width="260" height="75" rx="10" fill="#ede7f6" stroke="#5e35b1" stroke-width="1.8" filter="url(#shadow)" />
+  <text x="360" y="199" font-size="10" font-weight="700" fill="#5e35b1">STEP 2</text>
+  <text x="480" y="214" text-anchor="middle" font-size="14" font-weight="600" fill="#311b92">Scene Segmentation</text>
+  <text x="480" y="232" text-anchor="middle" font-size="11" fill="#5e35b1">SAM3 auto-mask</text>
+  <text x="480" y="248" text-anchor="middle" font-size="10" fill="#666">~95s</text>
+
+  <!-- Arrows: Input Video → Steps 1 & 2 -->
+  <path d="M 350 124 L 350 140 Q 350 148, 340 148 L 200 148 Q 190 148, 190 158 L 190 178" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)" />
+  <path d="M 430 124 L 430 140 Q 430 148, 440 148 L 470 148 Q 480 148, 480 158 L 480 178" fill="none" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)" />
+
+  <!-- Step 1 outputs -->
+  <rect x="68" y="272" width="70" height="26" rx="5" fill="#e8eaf6" stroke="#5c6bc0" stroke-width="1" />
+  <text x="103" y="290" text-anchor="middle" font-size="10" fill="#283593">Depth</text>
+
+  <rect x="155" y="272" width="70" height="26" rx="5" fill="#e8eaf6" stroke="#5c6bc0" stroke-width="1" />
+  <text x="190" y="290" text-anchor="middle" font-size="10" fill="#283593">Color</text>
+
+  <rect x="242" y="272" width="70" height="26" rx="5" fill="#e8eaf6" stroke="#5c6bc0" stroke-width="1" />
+  <text x="277" y="290" text-anchor="middle" font-size="10" fill="#283593">Camera</text>
+
+  <line x1="140" y1="255" x2="103" y2="272" stroke="#5c6bc0" stroke-width="1" />
+  <line x1="190" y1="255" x2="190" y2="272" stroke="#5c6bc0" stroke-width="1" />
+  <line x1="240" y1="255" x2="277" y2="272" stroke="#5c6bc0" stroke-width="1" />
+
+  <!-- Step 2 output -->
+  <rect x="430" y="272" width="100" height="26" rx="5" fill="#ede7f6" stroke="#7e57c2" stroke-width="1" />
+  <text x="480" y="290" text-anchor="middle" font-size="10" fill="#4527a0">Label Maps</text>
+  <line x1="480" y1="255" x2="480" y2="272" stroke="#7e57c2" stroke-width="1" />
+
+  <!-- ==================== STEP 3 ==================== -->
+
+  <rect x="60" y="345" width="570" height="120" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.8" filter="url(#shadow)" />
+  <text x="75" y="366" font-size="10" font-weight="700" fill="#388e3c">STEP 3</text>
+  <text x="345" y="370" text-anchor="middle" font-size="15" font-weight="600" fill="#1b5e20">Object Detection &amp; 3D Reconstruction</text>
+  <text x="345" y="392" text-anchor="middle" font-size="11" fill="#2e7d32">SAM3  +  Gaussian Splat Diffusion</text>
+
+  <text x="80" y="416" font-size="10" fill="#555">1. Detect object (text / hand-point prompt)</text>
+  <text x="80" y="430" font-size="10" fill="#555">2. Temporal mask propagation (bidirectional)</text>
+  <text x="80" y="444" font-size="10" fill="#555">3. 3D Gaussian splat reconstruction</text>
+  <text x="530" y="458" text-anchor="middle" font-size="10" fill="#666">~130s</text>
+
+  <!-- Arrows: Step 1 outputs → Step 3 -->
+  <!-- Camera → Step 3 -->
+  <path d="M 277 298 L 277 322 Q 277 332, 287 332 L 310 332 Q 320 332, 320 342 L 320 343" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+  <text x="302" y="328" font-size="9" fill="#777">poses</text>
+
+  <!-- Input Video → Step 3 (video frames) -->
+  <path d="M 390 124 L 390 134 Q 390 140, 396 140 L 640 140 Q 650 140, 650 150 L 650 335 Q 650 345, 640 345 L 632 345" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+  <text x="656" y="240" font-size="9" fill="#777" transform="rotate(-90, 656, 240)">video frames</text>
+
+  <!-- VITRA → Step 3 -->
+  <path d="M 800 124 L 800 145 Q 800 155, 790 155 L 690 155 Q 680 155, 680 165 L 680 335 Q 680 345, 670 345 L 632 345" fill="none" stroke="#e65100" stroke-width="1.3" stroke-dasharray="6,3" marker-end="url(#arrow)" />
+  <text x="700" y="155" font-size="9" fill="#e65100">hand joints</text>
+
+  <!-- Step 3 outputs -->
+  <rect x="255" y="480" width="100" height="26" rx="5" fill="#e8f5e9" stroke="#66bb6a" stroke-width="1" />
+  <text x="305" y="498" text-anchor="middle" font-size="10" fill="#2e7d32">Object PLY</text>
+
+  <rect x="375" y="480" width="100" height="26" rx="5" fill="#e8f5e9" stroke="#66bb6a" stroke-width="1" />
+  <text x="425" y="498" text-anchor="middle" font-size="10" fill="#2e7d32">Object Masks</text>
+
+  <line x1="310" y1="465" x2="305" y2="480" stroke="#66bb6a" stroke-width="1" />
+  <line x1="380" y1="465" x2="425" y2="480" stroke="#66bb6a" stroke-width="1" />
+
+  <!-- ==================== STEP 4 ==================== -->
+
+  <rect x="60" y="545" width="570" height="160" rx="10" fill="#fce4ec" stroke="#c62828" stroke-width="1.8" filter="url(#shadow)" />
+  <text x="75" y="566" font-size="10" font-weight="700" fill="#c62828">STEP 4</text>
+  <text x="345" y="570" text-anchor="middle" font-size="15" font-weight="600" fill="#b71c1c">Combine into 3D Point Cloud</text>
+
+  <!-- Sub-components row 1 -->
+  <rect x="80" y="585" width="140" height="38" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="150" y="602" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">Scene Unproject</text>
+  <text x="150" y="615" text-anchor="middle" font-size="9" fill="#888">depth → 3D points</text>
+
+  <rect x="235" y="585" width="150" height="38" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="310" y="602" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">MANO Hand Mesh</text>
+  <text x="310" y="615" text-anchor="middle" font-size="9" fill="#888">Procrustes-aligned to joints</text>
+
+  <rect x="400" y="585" width="150" height="38" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="475" y="602" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">Object Transform</text>
+  <text x="475" y="615" text-anchor="middle" font-size="9" fill="#888">Gaussian splat → scene scale</text>
+
+  <!-- Sub-components row 2 -->
+  <rect x="80" y="635" width="140" height="34" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="150" y="653" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">Hand Excision</text>
+  <text x="150" y="664" text-anchor="middle" font-size="9" fill="#888">replace scene w/ mesh</text>
+
+  <rect x="235" y="635" width="150" height="34" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="310" y="653" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">Object Excision</text>
+  <text x="310" y="664" text-anchor="middle" font-size="9" fill="#888">3 mask modes</text>
+
+  <rect x="400" y="635" width="210" height="34" rx="6" fill="#fff" stroke="#e57373" stroke-width="1" />
+  <text x="505" y="653" text-anchor="middle" font-size="10" font-weight="500" fill="#c62828">Occlusion Cull + Metric Scale</text>
+  <text x="505" y="664" text-anchor="middle" font-size="9" fill="#888">z-buffer + joint-based rescaling</text>
+
+  <text x="345" y="698" text-anchor="middle" font-size="10" fill="#666">~25s</text>
+
+  <!-- Arrows into Step 4 -->
+  <!-- Depth → Step 4 -->
+  <path d="M 103 298 L 103 530 Q 103 540, 113 540 L 130 540 Q 140 540, 140 550 L 140 543" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+
+  <!-- Color → Step 4 -->
+  <path d="M 190 298 L 190 525 Q 190 535, 200 535 L 225 535 Q 235 535, 235 545 L 235 543" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+
+  <!-- Camera → Step 4 -->
+  <path d="M 277 298 L 277 315 Q 277 322, 270 322 L 50 322 Q 40 322, 40 332 L 40 530 Q 40 540, 50 540 L 55 540 Q 58 540, 58 550 L 58 543" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+
+  <!-- Object PLY → Step 4 -->
+  <path d="M 305 506 L 305 520 Q 305 530, 315 530 L 340 530 Q 350 530, 350 540 L 350 543" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+
+  <!-- Object Masks → Step 4 -->
+  <path d="M 425 506 L 425 520 Q 425 530, 435 530 L 460 530 Q 470 530, 470 540 L 470 543" fill="none" stroke="#555" stroke-width="1.3" marker-end="url(#arrow)" />
+
+  <!-- VITRA → Step 4 (hand params) -->
+  <path d="M 850 124 L 850 530 Q 850 540, 840 540 L 620 540 Q 610 540, 610 550 L 610 543" fill="none" stroke="#e65100" stroke-width="1.3" stroke-dasharray="6,3" marker-end="url(#arrow)" />
+  <text x="858" y="440" font-size="9" fill="#e65100" transform="rotate(-90, 858, 440)">hand params</text>
+
+  <!-- ==================== OUTPUT ==================== -->
+
+  <rect x="225" y="740" width="240" height="50" rx="10" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2" filter="url(#shadow)" />
+  <text x="345" y="763" text-anchor="middle" font-size="14" font-weight="700" fill="#1b5e20">Per-Frame PLY</text>
+  <text x="345" y="779" text-anchor="middle" font-size="10" fill="#388e3c">scene + hands + objects (metric)</text>
+
+  <!-- Arrow: Step 4 → Output -->
+  <path d="M 345 705 L 345 738" fill="none" stroke="#555" stroke-width="1.8" marker-end="url(#arrow)" />
+
+  <!-- ==================== LEGEND ==================== -->
+  <rect x="680" y="740" width="220" height="65" rx="6" fill="#fff" stroke="#ddd" stroke-width="1" />
+  <text x="693" y="757" font-size="10" font-weight="600" fill="#333">Legend</text>
+  <rect x="693" y="765" width="12" height="8" rx="2" fill="#e3f2fd" stroke="#1976d2" stroke-width="1" />
+  <text x="711" y="773" font-size="9" fill="#555">Scene recon</text>
+  <rect x="693" y="779" width="12" height="8" rx="2" fill="#ede7f6" stroke="#5e35b1" stroke-width="1" />
+  <text x="711" y="787" font-size="9" fill="#555">Scene seg</text>
+  <rect x="693" y="793" width="12" height="8" rx="2" fill="#e8f5e9" stroke="#388e3c" stroke-width="1" />
+  <text x="711" y="801" font-size="9" fill="#555">Object recon</text>
+  <rect x="790" y="765" width="12" height="8" rx="2" fill="#fce4ec" stroke="#c62828" stroke-width="1" />
+  <text x="808" y="773" font-size="9" fill="#555">Combine</text>
+  <rect x="790" y="779" width="12" height="8" rx="2" fill="#fff3e0" stroke="#ff9800" stroke-width="1" />
+  <text x="808" y="787" font-size="9" fill="#555">External inputs</text>
+  <line x1="790" y1="797" x2="802" y2="797" stroke="#e65100" stroke-width="1.3" stroke-dasharray="4,2" />
+  <text x="808" y="801" font-size="9" fill="#555">VITRA data flow</text>
+
+  <!-- Timing annotation -->
+  <text x="920" y="815" text-anchor="end" font-size="10" fill="#999">Total: ~200s / video (single A6000)</text>
+</svg>

@@ -1,0 +1,6 @@
+[submodule "sam-3d-objects"]
+	path = sam-3d-objects
+	url = git@github.com:lifchrs/sam-3d-objects.git
+[submodule "TTT3R"]
+	path = TTT3R
+	url = https://github.com/Inception3D/TTT3R.git

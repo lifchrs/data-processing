@@ -1,1 +1,41 @@
+# 3D outputs
 **/*.ply
+**/*.glb
+
+# Python
+__pycache__/
+*.pyc
+
+# Large / generated files
+*.mp4
+*.webm
+
+# Output directories
+*_output/
+*_output*/
+processed_videos/
+reconstruction_*/
+experiments/
+
+# SLURM logs
+*.out
+
+# IDE
+.cursor*
+
+# Misc
+bruh.txt
+ne/
+v2/
+videos/
+viewer_export.html
+
+# Pipeline batch output
+unified_pipeline/batch_*_output/
+unified_pipeline/bench_*/
+unified_pipeline/hand_debug_*/
+unified_pipeline/viewer_export.html
+
+# Model checkpoints (downloaded, not committed)
+sam-3d-objects/checkpoints/
+TTT3R/src/*.pth

@@ -1,0 +1,21 @@
+# Output directories
+*_output/
+batch_*/output*/
+bench_*/
+
+# Large viewer exports (embedded point cloud data)
+viewer_export.html
+
+# Debug scripts
+debug_*.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Data
+*.ply
+*.glb
+*.obj
+*.mtl
+*.npy

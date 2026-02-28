@@ -968,14 +968,15 @@ def main():
 
         if vitra_ann is not None and mano_data is not None:
             # VITRA-based hand reconstruction using MANO forward pass
-            # Map TTT3R frame index to VITRA temporal index
-            vitra_frame_indices = vitra_ann.get('video_decode_frame', np.arange(100))
-            video_frame_idx = int(basename) * args.stride
-            vitra_idx = None
-            for vi, vf in enumerate(vitra_frame_indices):
-                if vf == video_frame_idx:
-                    vitra_idx = vi
-                    break
+            # TTT3R frame i corresponds to VITRA temporal index i (both
+            # process the same clip sequentially).  video_decode_frame
+            # contains original video frame numbers, NOT clip-local indices.
+            vitra_idx = int(basename) * args.stride
+            n_vitra = len(vitra_ann.get('video_decode_frame', []))
+            if vitra_idx >= n_vitra:
+                vitra_idx = None
+            if vitra_idx is None:
+                print(f"  Frame {basename} not in VITRA annotation")
 
             if vitra_idx is not None:
                 for hand_name, is_left in [('right', False), ('left', True)]:
@@ -1083,8 +1084,6 @@ def main():
                     hand_pts_list.append(hand_pts_world)
                     hand_colors_list.append(hand_colors)
                     print(f"  {hand_name} hand: {len(hand_pts_world)} points")
-            else:
-                print(f"  Frame {video_frame_idx} not in VITRA annotation")
 
         elif args.wilor_out is not None:
             # Legacy WiLoR-based hand reconstruction

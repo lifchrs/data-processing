@@ -80,7 +80,7 @@ else
     echo "  Run 'huggingface-cli login' first if not already authenticated."
     eval "$(conda shell.bash hook)"
     conda activate sam3d-objects
-    pip install 'huggingface-hub[cli]<1.0' 2>/dev/null || true
+    pip install 'huggingface-hub[cli]' 2>/dev/null || true
     python -m huggingface_hub.commands.huggingface_cli download \
         --repo-type model \
         --local-dir sam-3d-objects/checkpoints/hf \

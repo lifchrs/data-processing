@@ -11,8 +11,6 @@ Video + (optional) VITRA annotation
   → Step 4  Combine Point Cloud    (final PLY + OBJ files)
 ```
 
-![Pipeline overview](pipeline_overview.svg)
-
 ## Quick start
 
 ```bash

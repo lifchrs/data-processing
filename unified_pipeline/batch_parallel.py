@@ -6,17 +6,17 @@ Distributes N videos across M GPUs, running one video per GPU simultaneously.
 Achieves near-linear throughput scaling: 8 GPUs → ~8× throughput.
 
 Usage:
-    # Auto-detect GPUs, process 50 SSv2 videos:
-    python batch_parallel.py --num_videos 50
+    # Process specific annotation files (auto-finds SSv2 videos):
+    python batch_parallel.py --annotations path/to/*.npy --ssv2_video_dir /data/ssv2/videos
 
     # Use specific GPUs:
-    python batch_parallel.py --num_videos 20 --gpus 0,1,2,3
+    python batch_parallel.py --annotations *.npy --ssv2_video_dir /data/ssv2 --gpus 0,1,2,3
 
     # Process a manifest file (JSON list of {video_path, annotation_path, ...}):
     python batch_parallel.py --manifest videos.json
 
     # With pipeline flags:
-    python batch_parallel.py --num_videos 10 --skip_scene_seg --frame_interval 2
+    python batch_parallel.py --manifest videos.json --skip_scene_seg --frame_interval 2
 """
 
 import argparse
@@ -27,10 +27,8 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Import SSv2 selection utilities from batch_test_ssv2
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "vitra_data", "pipeline"))
 
 
 def detect_gpus():
@@ -67,74 +65,91 @@ def load_manifest(manifest_path):
     return episodes
 
 
-def select_ssv2_episodes(num_videos, seed=42):
-    """Select SSv2 episodes with valid hand data (reuses batch_test_ssv2 logic)."""
-    try:
-        from vitra_utils import load_vitra_annotation, get_video_info, get_text_prompt
-    except ImportError:
-        print("ERROR: vitra_utils not found. Use --manifest instead of --num_videos.")
-        sys.exit(1)
+def _detect_dataset(annotation_path):
+    """Determine the source dataset from an annotation filename prefix."""
+    basename = os.path.basename(annotation_path)
+    for prefix, dataset in [
+        ("somethingsomethingv2_", "ssv2"),
+        ("epic_kitchens_", "epic"),
+        ("EgoExo4D_", "egoexo4d"),
+        ("Ego4D_", "ego4d"),
+    ]:
+        if basename.startswith(prefix):
+            return dataset, prefix
+    return None, ""
 
-    import random
+
+def _extract_video_name(annotation_path):
+    """Extract the video ID from an annotation filename."""
+    import re
+    basename = os.path.splitext(os.path.basename(annotation_path))[0]
+    m = re.match(r"^(.+)_ep_\d+$", basename)
+    body = m.group(1) if m else basename
+    for prefix, _ in [
+        ("somethingsomethingv2_", "ssv2"),
+        ("epic_kitchens_", "epic"),
+        ("EgoExo4D_", "egoexo4d"),
+        ("Ego4D_", "ego4d"),
+    ]:
+        if body.startswith(prefix):
+            return body[len(prefix):]
+    return body
+
+
+def _get_action_text(annotation):
+    """Extract action text from a loaded VITRA annotation dict."""
+    text_data = annotation.get("text", {})
+    for hand in ["left", "right"]:
+        entries = text_data.get(hand, [])
+        if entries:
+            return entries[0][0]
+    return "object held in hand"
+
+
+def episodes_from_annotations(annotation_paths, ssv2_video_dir):
+    """Build episode list from .npy annotation files, auto-resolving video paths.
+
+    For SSv2 annotations, the video is looked up automatically in
+    ssv2_video_dir.  Other datasets require a --manifest with explicit video_path.
+    """
     import numpy as np
 
-    annot_dir = os.path.join(PROJECT_ROOT, "vitra_data", "ssv2", "episodic_annotations")
-    video_dir = os.path.join(PROJECT_ROOT, "VITRA", "20bn-something-something-v2")
+    episodes = []
+    for annot_path in annotation_paths:
+        annot_path = os.path.abspath(annot_path)
+        dataset, _ = _detect_dataset(annot_path)
+        video_name = _extract_video_name(annot_path)
 
-    if not os.path.isdir(annot_dir):
-        print(f"ERROR: Annotation directory not found: {annot_dir}")
-        sys.exit(1)
-
-    annots = sorted(os.listdir(annot_dir))
-    random.seed(seed)
-    random.shuffle(annots)
-
-    selected = []
-    for fname in annots:
-        if len(selected) >= num_videos:
-            break
-
-        annot_path = os.path.join(annot_dir, fname)
-        annotation = load_vitra_annotation(annot_path)
-        info = get_video_info(annotation)
-
-        # Find video file
+        # Resolve video path based on dataset
         video_path = None
-        for ext in [".webm", ".mp4"]:
-            p = os.path.join(video_dir, f"{info['video_name']}{ext}")
-            if os.path.exists(p):
-                video_path = p
-                break
-        if video_path is None:
+        if dataset == "ssv2":
+            for ext in [".webm", ".mp4"]:
+                p = os.path.join(ssv2_video_dir, f"{video_name}{ext}")
+                if os.path.exists(p):
+                    video_path = p
+                    break
+            if video_path is None:
+                print(f"WARNING: SSv2 video not found for {video_name} "
+                      f"in {ssv2_video_dir}, skipping")
+                continue
+        else:
+            print(f"WARNING: Auto video lookup not supported for dataset "
+                  f"'{dataset}' ({os.path.basename(annot_path)}). "
+                  f"Use --manifest with explicit video_path instead.")
             continue
 
-        action_text = get_text_prompt(annotation)
-        if action_text == "object held in hand":
-            continue
+        # Load annotation for action text
+        annotation = np.load(annot_path, allow_pickle=True).item()
+        action_text = _get_action_text(annotation)
 
-        # Check hand data
-        text_data = annotation.get("text", {})
-        active_hand = None
-        for hand in ["left", "right"]:
-            if text_data.get(hand, []):
-                active_hand = hand
-                break
-        if active_hand is None:
-            continue
-
-        hand_data = annotation.get(active_hand, {})
-        kept_frames = hand_data.get("kept_frames")
-        if kept_frames is None or np.sum(kept_frames) < 5:
-            continue
-
-        selected.append({
+        episodes.append({
             "annotation_path": annot_path,
             "video_path": video_path,
-            "video_name": info["video_name"],
+            "video_name": video_name,
             "action_text": action_text,
         })
 
-    return selected
+    return episodes
 
 
 def run_single_video(episode, output_dir, gpu_id, pipeline_args):
@@ -306,10 +321,11 @@ def main():
 
     # Video source (one of these required)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--num_videos", type=int,
-                        help="Number of SSv2 videos to process (auto-selects from annotations)")
     source.add_argument("--manifest", type=str,
                         help="Path to JSON manifest file with video list")
+    source.add_argument("--annotations", nargs="+", metavar="NPY",
+                        help="VITRA .npy annotation files. For SSv2 annotations the "
+                             "video is found automatically.")
 
     # GPU config
     parser.add_argument("--gpus", type=str, default=None,
@@ -324,8 +340,9 @@ def main():
     # Output
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Batch output directory (default: unified_pipeline/batch_parallel_output)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for SSv2 selection (default: 42)")
+    parser.add_argument("--ssv2_video_dir", type=str, default=None,
+                        help="Directory containing SSv2 video files. Required with "
+                             "--annotations for SSv2 annotations.")
 
     # Pipeline flags (passed through to run_pipeline.py)
     parser.add_argument("--frame_interval", type=int, default=1)
@@ -363,7 +380,16 @@ def main():
     if args.manifest:
         episodes = load_manifest(args.manifest)
     else:
-        episodes = select_ssv2_episodes(args.num_videos, seed=args.seed)
+        if args.ssv2_video_dir is None:
+            # Default to the old location if it exists, otherwise error
+            default_dir = os.path.join(PROJECT_ROOT, "VITRA", "20bn-something-something-v2")
+            if os.path.isdir(default_dir):
+                args.ssv2_video_dir = default_dir
+            else:
+                print("ERROR: --ssv2_video_dir is required with --annotations "
+                      "(directory containing SSv2 .webm/.mp4 files)")
+                sys.exit(1)
+        episodes = episodes_from_annotations(args.annotations, args.ssv2_video_dir)
 
     if not episodes:
         print("ERROR: No videos to process.")

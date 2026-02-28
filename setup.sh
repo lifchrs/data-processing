@@ -66,6 +66,19 @@ else
     pip install -r TTT3R/requirements.txt
     conda deactivate
 fi
+
+# Build CuRoPE2D CUDA extension (required — pure-PyTorch fallback crashes)
+if [ -f TTT3R/src/croco/models/curope/curope.cpython-*.so ]; then
+    echo "  CuRoPE2D CUDA extension already built, skipping."
+else
+    echo "  Building CuRoPE2D CUDA extension for TTT3R..."
+    eval "$(conda shell.bash hook)"
+    conda activate ttt3r
+    cd TTT3R/src/croco/models/curope
+    python setup.py build_ext --inplace
+    cd "$ROOT_DIR"
+    conda deactivate
+fi
 echo ""
 
 # ── 4. Download model checkpoints ────────────────────────────────────────────

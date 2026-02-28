@@ -163,14 +163,35 @@ def run_ttt3r(video_path, output_dir, frame_interval, device, ttt3r_env,
     log.log("step1_reconstruction", f"Running: {' '.join(cmd)}\n",
             command=cmd)
 
+    # Use Popen instead of run: TTT3R's demo.py launches a blocking point
+    # cloud viewer after saving outputs.  We poll for the expected output
+    # files and terminate the process once they appear.
     t0 = time.time()
-    result = subprocess.run(cmd, check=False, env=get_env_vars(ttt3r_env))
+    proc = subprocess.Popen(cmd, env=get_env_vars(ttt3r_env))
+
+    # Wait for depth outputs to appear (written before the viewer launches)
+    depth_dir = os.path.join(ttt3r_out, "depth")
+    camera_dir = os.path.join(ttt3r_out, "camera")
+    while proc.poll() is None:
+        time.sleep(2)
+        if (os.path.isdir(depth_dir) and os.listdir(depth_dir)
+                and os.path.isdir(camera_dir) and os.listdir(camera_dir)):
+            # Give a moment for file writes to flush
+            time.sleep(3)
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            break
+
     elapsed = time.time() - t0
 
-    if result.returncode != 0:
+    # Check that outputs actually exist (process may have crashed before writing)
+    if not os.path.isdir(depth_dir) or not os.listdir(depth_dir):
         log.log("step1_reconstruction",
-                f"\nERROR: TTT3R failed with return code {result.returncode}",
-                returncode=result.returncode, elapsed_s=elapsed, success=False)
+                f"\nERROR: TTT3R produced no output in {depth_dir}",
+                returncode=proc.returncode, elapsed_s=elapsed, success=False)
         sys.exit(1)
 
     log.log("step1_reconstruction",

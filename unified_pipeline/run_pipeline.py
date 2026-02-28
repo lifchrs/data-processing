@@ -169,15 +169,29 @@ def run_ttt3r(video_path, output_dir, frame_interval, device, ttt3r_env,
     t0 = time.time()
     proc = subprocess.Popen(cmd, env=get_env_vars(ttt3r_env))
 
-    # Wait for depth outputs to appear (written before the viewer launches)
+    # Wait for outputs to stabilise before terminating.  TTT3R writes
+    # depth/color/camera files and then launches a blocking viewer.  We
+    # detect completion by watching the file count: once it stops growing
+    # for two consecutive checks the inference is done.
     depth_dir = os.path.join(ttt3r_out, "depth")
+    color_dir = os.path.join(ttt3r_out, "color")
     camera_dir = os.path.join(ttt3r_out, "camera")
+    prev_count = -1
+    stable_ticks = 0
     while proc.poll() is None:
-        time.sleep(2)
-        if (os.path.isdir(depth_dir) and os.listdir(depth_dir)
-                and os.path.isdir(camera_dir) and os.listdir(camera_dir)):
-            # Give a moment for file writes to flush
-            time.sleep(3)
+        time.sleep(3)
+        try:
+            cur_count = (len(os.listdir(depth_dir)) +
+                         len(os.listdir(color_dir)) +
+                         len(os.listdir(camera_dir)))
+        except FileNotFoundError:
+            cur_count = 0
+        if cur_count > 0 and cur_count == prev_count:
+            stable_ticks += 1
+        else:
+            stable_ticks = 0
+        prev_count = cur_count
+        if stable_ticks >= 2:
             proc.terminate()
             try:
                 proc.wait(timeout=10)

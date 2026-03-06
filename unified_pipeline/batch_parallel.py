@@ -2,98 +2,86 @@
 """
 Multi-GPU parallel batch processor for the unified pipeline.
 
-Distributes N videos across M GPUs, running one video per GPU simultaneously.
-Achieves near-linear throughput scaling: 8 GPUs → ~8× throughput.
+Distributes N videos across G GPUs using persistent batch workers — each GPU
+loads models once and processes its N/G videos sequentially.
+
+Input: JSON file with video directories and episode list (see example_input.json):
+
+    {
+        "ssv2_video_dir": "VITRA/20bn-something-something-v2",
+        "epic_video_dir": "vitra_data/epic_videos/EPIC-KITCHENS",
+        "episodes": [
+            {"annotation_path": "vitra_data/ssv2/episodic_annotations/somethingsomethingv2_100000_ep_000000.npy"},
+            {"annotation_path": "vitra_data/epic_annotations/epic/episodic_annotations/epic_kitchens_P01_01_ep_000229.npy"}
+        ]
+    }
+
+Videos are auto-resolved from the annotation filename:
+  - SSv2:  looks in ssv2_video_dir for {video_id}.webm or .mp4
+  - Epic:  extracts clip from source video in epic_video_dir/{participant}/videos/{video}.MP4
+  - Other: provide "video_path" explicitly in the episode entry
 
 Usage:
-    # Process specific annotation files (auto-finds SSv2 videos):
-    python batch_parallel.py --annotations path/to/*.npy --ssv2_video_dir /data/ssv2/videos
-
-    # Use specific GPUs:
-    python batch_parallel.py --annotations *.npy --ssv2_video_dir /data/ssv2 --gpus 0,1,2,3
-
-    # Process a manifest file (JSON list of {video_path, annotation_path, ...}):
-    python batch_parallel.py --manifest videos.json
-
-    # With pipeline flags:
-    python batch_parallel.py --manifest videos.json --skip_scene_seg --frame_interval 2
+    python batch_parallel.py --input example_input.json
+    python batch_parallel.py --input episodes.json --output_dir ./output --gpus 0,1,2,3
 """
 
-import argparse
 import json
 import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 
-def detect_gpus():
-    """Detect available NVIDIA GPUs via nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, check=True,
-        )
-        return [int(idx.strip()) for idx in result.stdout.strip().split("\n") if idx.strip()]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return [0]
+# ---------------------------------------------------------------------------
+# Dataset detection + video resolution
+# ---------------------------------------------------------------------------
 
-
-def load_manifest(manifest_path):
-    """Load a JSON manifest of videos to process.
-
-    Expected format: list of dicts with at least 'video_path'.
-    Optional keys: 'annotation_path', 'video_name', 'action_text'.
-    """
-    with open(manifest_path) as f:
-        entries = json.load(f)
-
-    episodes = []
-    for entry in entries:
-        ep = {
-            "video_path": entry["video_path"],
-            "annotation_path": entry.get("annotation_path"),
-            "video_name": entry.get("video_name",
-                                    os.path.splitext(os.path.basename(entry["video_path"]))[0]),
-            "action_text": entry.get("action_text", ""),
-        }
-        episodes.append(ep)
-    return episodes
+# Dataset config: (annotation prefix, default video dir relative to PROJECT_ROOT)
+_DATASET_CONFIG = [
+    ("somethingsomethingv2_", "ssv2",    None),
+    ("epic_kitchens_",       "epic",     "vitra_data/epic_videos/EPIC-KITCHENS"),
+    ("EgoExo4D_",            "egoexo4d", None),
+    ("Ego4D_",               "ego4d",    None),
+]
 
 
 def _detect_dataset(annotation_path):
     """Determine the source dataset from an annotation filename prefix."""
     basename = os.path.basename(annotation_path)
-    for prefix, dataset in [
-        ("somethingsomethingv2_", "ssv2"),
-        ("epic_kitchens_", "epic"),
-        ("EgoExo4D_", "egoexo4d"),
-        ("Ego4D_", "ego4d"),
-    ]:
+    for prefix, dataset, _ in _DATASET_CONFIG:
         if basename.startswith(prefix):
             return dataset, prefix
     return None, ""
 
 
 def _extract_video_name(annotation_path):
-    """Extract the video ID from an annotation filename."""
+    """Extract the video/episode ID from an annotation filename.
+
+    Returns (video_name, episode_id) where:
+      - video_name: the source video identifier (e.g. "12345" for SSv2, "P01_01" for Epic)
+      - episode_id: unique episode identifier used for output directory naming
+    """
     import re
     basename = os.path.splitext(os.path.basename(annotation_path))[0]
-    m = re.match(r"^(.+)_ep_\d+$", basename)
-    body = m.group(1) if m else basename
-    for prefix, _ in [
-        ("somethingsomethingv2_", "ssv2"),
-        ("epic_kitchens_", "epic"),
-        ("EgoExo4D_", "egoexo4d"),
-        ("Ego4D_", "ego4d"),
-    ]:
-        if body.startswith(prefix):
-            return body[len(prefix):]
-    return body
+    dataset, prefix = _detect_dataset(annotation_path)
+
+    # Strip dataset prefix
+    body = basename[len(prefix):] if prefix else basename
+
+    # Strip _ep_NNNNNN suffix to get video name
+    m = re.match(r"^(.+)_ep_\d+$", body)
+    video_name = m.group(1) if m else body
+
+    # Episode ID is the full body (without dataset prefix)
+    episode_id = body
+
+    return video_name, episode_id
 
 
 def _get_action_text(annotation):
@@ -106,212 +94,156 @@ def _get_action_text(annotation):
     return "object held in hand"
 
 
-def episodes_from_annotations(annotation_paths, ssv2_video_dir):
-    """Build episode list from .npy annotation files, auto-resolving video paths.
+def _resolve_ssv2_video(video_name, ssv2_video_dir):
+    """Find an SSv2 video file by ID."""
+    if not ssv2_video_dir:
+        return None
+    for ext in [".webm", ".mp4"]:
+        p = os.path.join(ssv2_video_dir, f"{video_name}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
 
-    For SSv2 annotations, the video is looked up automatically in
-    ssv2_video_dir.  Other datasets require a --manifest with explicit video_path.
+
+def _resolve_epic_video(video_name, annotation, epic_video_dir, output_dir):
+    """Find Epic-Kitchens source video and extract clip.
+
+    Epic-Kitchens annotations reference a subclip of a long source video.
+    We extract the clip to output_dir/clips/ using ffmpeg.
     """
-    import numpy as np
+    if not epic_video_dir:
+        return None
+
+    # Find source video: {epic_video_dir}/{participant}/videos/{video_name}.MP4
+    participant = video_name.split("_")[0]  # P01_01 -> P01
+    source_path = os.path.join(epic_video_dir, participant, "videos", f"{video_name}.MP4")
+    if not os.path.exists(source_path):
+        return None
+
+    # Extract clip
+    annot_basename = os.path.splitext(os.path.basename(
+        annotation["_annotation_path"]))[0]
+    clip_path = os.path.join(output_dir, "clips", f"{annot_basename}.mp4")
+
+    if os.path.exists(clip_path):
+        return clip_path
+
+    os.makedirs(os.path.dirname(clip_path), exist_ok=True)
+
+    vdf = annotation.get("video_decode_frame")
+    if vdf is None:
+        return None
+
+    fps = 60.0  # Epic-Kitchens
+    start_frame = int(vdf[0])
+    num_frames = len(vdf)
+    total_seconds = start_frame / fps
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = total_seconds % 60
+    start_time = f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", start_time,
+        "-i", source_path,
+        "-frames:v", str(num_frames),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        clip_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  WARNING: ffmpeg clip extraction failed: {result.stderr[:200]}")
+        return None
+
+    return clip_path
+
+
+def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
+                     epic_video_dir=None, base_dir=None):
+    """Resolve input entries to full episodes with video paths.
+
+    Each input entry needs at minimum 'annotation_path'. If 'video_path' is
+    not provided, it's auto-resolved based on the dataset detected from the
+    annotation filename.
+
+    Relative paths in entries are resolved against base_dir (defaults to cwd).
+    """
+    if base_dir is None:
+        base_dir = os.getcwd()
+    # Default video directories
+    if ssv2_video_dir is None:
+        default = os.path.join(PROJECT_ROOT, "VITRA", "20bn-something-something-v2")
+        if os.path.isdir(default):
+            ssv2_video_dir = default
+
+    if epic_video_dir is None:
+        for _, dataset, rel_path in _DATASET_CONFIG:
+            if dataset == "epic" and rel_path:
+                default = os.path.join(PROJECT_ROOT, rel_path)
+                if os.path.isdir(default):
+                    epic_video_dir = default
+                break
 
     episodes = []
-    for annot_path in annotation_paths:
+    for entry in input_entries:
+        annot_path = entry["annotation_path"]
+        if not os.path.isabs(annot_path):
+            annot_path = os.path.join(base_dir, annot_path)
         annot_path = os.path.abspath(annot_path)
-        dataset, _ = _detect_dataset(annot_path)
-        video_name = _extract_video_name(annot_path)
 
-        # Resolve video path based on dataset
-        video_path = None
-        if dataset == "ssv2":
-            for ext in [".webm", ".mp4"]:
-                p = os.path.join(ssv2_video_dir, f"{video_name}{ext}")
-                if os.path.exists(p):
-                    video_path = p
-                    break
-            if video_path is None:
-                print(f"WARNING: SSv2 video not found for {video_name} "
-                      f"in {ssv2_video_dir}, skipping")
-                continue
-        else:
-            print(f"WARNING: Auto video lookup not supported for dataset "
-                  f"'{dataset}' ({os.path.basename(annot_path)}). "
-                  f"Use --manifest with explicit video_path instead.")
+        if not os.path.exists(annot_path):
+            print(f"WARNING: Annotation not found: {annot_path}, skipping")
             continue
 
-        # Load annotation for action text
+        dataset, _ = _detect_dataset(annot_path)
+        video_name, episode_id = _extract_video_name(annot_path)
+
+        # Load annotation for action text and clip extraction
         annotation = np.load(annot_path, allow_pickle=True).item()
+        annotation["_annotation_path"] = annot_path
         action_text = _get_action_text(annotation)
 
+        # Resolve video path
+        video_path = entry.get("video_path")
+        if video_path:
+            if not os.path.isabs(video_path):
+                video_path = os.path.join(base_dir, video_path)
+            video_path = os.path.abspath(video_path)
+        if video_path and os.path.exists(video_path):
+            pass  # use as-is
+        elif dataset == "ssv2":
+            video_path = _resolve_ssv2_video(video_name, ssv2_video_dir)
+            if video_path is None:
+                print(f"WARNING: SSv2 video not found for {video_name}, skipping")
+                continue
+        elif dataset == "epic":
+            video_path = _resolve_epic_video(
+                video_name, annotation, epic_video_dir, output_dir)
+            if video_path is None:
+                print(f"WARNING: Epic video not found/extracted for {video_name}, skipping")
+                continue
+        else:
+            if video_path is None:
+                print(f"WARNING: No video_path for {dataset} annotation "
+                      f"{os.path.basename(annot_path)}, skipping")
+                continue
+            video_path = os.path.abspath(video_path)
+
         episodes.append({
-            "annotation_path": annot_path,
             "video_path": video_path,
-            "video_name": video_name,
+            "annotation_path": annot_path,
+            "video_name": episode_id,
             "action_text": action_text,
         })
 
     return episodes
 
 
-def run_single_video(episode, output_dir, gpu_id, pipeline_args):
-    """Run the unified pipeline on a single video, pinned to a specific GPU.
-
-    This function runs in a subprocess worker. It sets CUDA_VISIBLE_DEVICES
-    so the pipeline only sees the assigned GPU.
-    """
-    ep_output = os.path.join(output_dir, episode["video_name"])
-
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-    # Build pipeline command
-    python_bin = sys.executable  # use same Python that launched this script
-    cmd = [
-        python_bin, os.path.join(SCRIPT_DIR, "run_pipeline.py"),
-        "--video", episode["video_path"],
-        "--output_dir", ep_output,
-        "--device", "cuda",  # always cuda (mapped to the assigned GPU via CUDA_VISIBLE_DEVICES)
-    ]
-
-    if episode.get("annotation_path"):
-        cmd.extend(["--vitra_annotation", episode["annotation_path"]])
-
-    # Pass through pipeline flags
-    for key, val in pipeline_args.items():
-        if val is True:
-            cmd.append(f"--{key}")
-        elif val is not False and val is not None:
-            cmd.extend([f"--{key}", str(val)])
-
-    t0 = time.time()
-    result = subprocess.run(cmd, check=False, env=env)
-    elapsed = time.time() - t0
-
-    return {
-        "video_name": episode["video_name"],
-        "action_text": episode.get("action_text", ""),
-        "gpu_id": gpu_id,
-        "returncode": result.returncode,
-        "elapsed_seconds": round(elapsed, 1),
-        "output_dir": ep_output,
-    }
-
-
-def _run_with_batch_workers(episodes, output_dir, gpu_ids, max_parallel, pipeline_args):
-    """Partition videos across GPUs and run persistent batch workers.
-
-    Each GPU gets a batch_worker.py process that loads models once and
-    processes its assigned videos sequentially. Multiple GPUs run in parallel.
-    """
-    import tempfile
-
-    # Partition episodes across GPUs (round-robin)
-    gpu_episodes = {gpu_id: [] for gpu_id in gpu_ids}
-    for i, ep in enumerate(episodes):
-        gpu_id = gpu_ids[i % len(gpu_ids)]
-        gpu_episodes[gpu_id].append(ep)
-
-    # Create per-GPU manifest files
-    manifests = {}
-    for gpu_id, eps in gpu_episodes.items():
-        if not eps:
-            continue
-        # Build manifest entries with output_dir per video
-        manifest_entries = []
-        for ep in eps:
-            entry = {
-                "video_path": ep["video_path"],
-                "output_dir": os.path.join(output_dir, ep["video_name"]),
-                "annotation_path": ep.get("annotation_path"),
-                "video_name": ep["video_name"],
-            }
-            # Check if TTT3R frames exist (from a prior Step 1 run)
-            ttt3r_frames = os.path.join(entry["output_dir"], "ttt3r_output", "color")
-            if os.path.isdir(ttt3r_frames):
-                entry["frames_dir"] = ttt3r_frames
-            ttt3r_camera = os.path.join(entry["output_dir"], "ttt3r_output", "camera")
-            if os.path.isdir(ttt3r_camera):
-                entry["camera_dir"] = ttt3r_camera
-            manifest_entries.append(entry)
-
-        manifest_path = os.path.join(output_dir, f"manifest_gpu{gpu_id}.json")
-        with open(manifest_path, "w") as f:
-            json.dump(manifest_entries, f, indent=2)
-        manifests[gpu_id] = manifest_path
-
-    # Phase 1: Run TTT3R batch worker on each GPU (if not skipped)
-    if not pipeline_args.get("skip_reconstruction"):
-        print("Phase 1: Running TTT3R batch workers...")
-        _run_worker_phase(manifests, "ttt3r", gpu_ids, max_parallel, pipeline_args)
-
-    # Phase 2: Run SAM3D batch worker on each GPU
-    print("\nPhase 2: Running SAM3D batch workers (Steps 2-4)...")
-    # Update manifests with frames_dir/camera_dir now that TTT3R has run
-    for gpu_id, manifest_path in manifests.items():
-        with open(manifest_path) as f:
-            entries = json.load(f)
-        for entry in entries:
-            ttt3r_out = os.path.join(entry["output_dir"], "ttt3r_output")
-            entry["frames_dir"] = os.path.join(ttt3r_out, "color")
-            entry["camera_dir"] = os.path.join(ttt3r_out, "camera")
-        with open(manifest_path, "w") as f:
-            json.dump(entries, f, indent=2)
-
-    _run_worker_phase(manifests, "sam3d", gpu_ids, max_parallel, pipeline_args)
-
-    # Collect results
-    results = []
-    for ep in episodes:
-        ep_dir = os.path.join(output_dir, ep["video_name"])
-        success = os.path.isdir(os.path.join(ep_dir, "ply_output")) or \
-                  os.path.isdir(os.path.join(ep_dir, "sam3d_output"))
-        results.append({
-            "video_name": ep["video_name"],
-            "action_text": ep.get("action_text", ""),
-            "gpu_id": gpu_ids[episodes.index(ep) % len(gpu_ids)],
-            "returncode": 0 if success else 1,
-            "elapsed_seconds": 0,  # individual timing not available in batch mode
-            "output_dir": ep_dir,
-        })
-
-    return results
-
-
-def _run_worker_phase(manifests, mode, gpu_ids, max_parallel, pipeline_args):
-    """Launch batch_worker.py for each GPU in parallel."""
-    with ProcessPoolExecutor(max_workers=max_parallel) as executor:
-        futures = {}
-        for gpu_id, manifest_path in manifests.items():
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-            cmd = [
-                sys.executable, os.path.join(SCRIPT_DIR, "batch_worker.py"),
-                "--mode", mode,
-                "--manifest", manifest_path,
-                "--device", "cuda",
-                "--frame_interval", str(pipeline_args.get("frame_interval", 1)),
-            ]
-
-            if pipeline_args.get("skip_scene_seg"):
-                cmd.append("--skip_scene_seg")
-            if pipeline_args.get("skip_sam3d"):
-                cmd.append("--skip_sam3d")
-            if pipeline_args.get("skip_combine"):
-                cmd.append("--skip_combine")
-            if pipeline_args.get("skip_visualizations"):
-                cmd.append("--skip_visualizations")
-
-            future = executor.submit(
-                subprocess.run, cmd, check=False, env=env,
-            )
-            futures[future] = gpu_id
-
-        for future in as_completed(futures):
-            gpu_id = futures[future]
-            result = future.result()
-            status = "OK" if result.returncode == 0 else f"FAIL (rc={result.returncode})"
-            print(f"  GPU {gpu_id} {mode} worker: {status}")
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -319,170 +251,151 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Video source (one of these required)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--manifest", type=str,
-                        help="Path to JSON manifest file with video list")
-    source.add_argument("--annotations", nargs="+", metavar="NPY",
-                        help="VITRA .npy annotation files. For SSv2 annotations the "
-                             "video is found automatically.")
+    parser.add_argument("--input", type=str, required=True,
+                        help="JSON file listing episodes to process")
 
     # GPU config
     parser.add_argument("--gpus", type=str, default=None,
                         help="Comma-separated GPU IDs to use (default: auto-detect all)")
-    parser.add_argument("--max_parallel", type=int, default=None,
-                        help="Max videos to run in parallel (default: number of GPUs)")
-    parser.add_argument("--use_batch_worker", action="store_true",
-                        help="Use persistent batch workers (loads models once per GPU, "
-                             "processes multiple videos). Saves ~30-60s per video in model "
-                             "load time. Requires running in the correct conda env.")
 
     # Output
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Batch output directory (default: unified_pipeline/batch_parallel_output)")
-    parser.add_argument("--ssv2_video_dir", type=str, default=None,
-                        help="Directory containing SSv2 video files. Required with "
-                             "--annotations for SSv2 annotations.")
+                        help="Batch output directory (default: unified_pipeline/batch_output)")
 
-    # Pipeline flags (passed through to run_pipeline.py)
+    # Pipeline flags
+    parser.add_argument("--recon_method", type=str, default=None,
+                        choices=["ttt3r", "megasam", "pi3"],
+                        help="Scene reconstruction method (default: from JSON or ttt3r)")
     parser.add_argument("--frame_interval", type=int, default=1)
-    parser.add_argument("--use_megasam", action="store_true")
     parser.add_argument("--skip_reconstruction", action="store_true")
     parser.add_argument("--skip_scene_seg", action="store_true")
     parser.add_argument("--skip_sam3d", action="store_true")
     parser.add_argument("--skip_combine", action="store_true")
     parser.add_argument("--skip_visualizations", action="store_true")
-    parser.add_argument("--inference_steps", type=int, default=None,
-                        help="Diffusion steps for 3D reconstruction (default: 25). "
-                             "Lower values (e.g. 12) trade quality for speed.")
-    parser.add_argument("--early_exit_score", type=float, default=0.8,
-                        help="Stop sampling detection frames once score exceeds this (default: 0.8)")
 
-    # Conda envs (passed through)
+    # Conda envs
     parser.add_argument("--ttt3r_env", type=str, default="ttt3r")
-    parser.add_argument("--megasam_env", type=str, default="mega_sam")
+    parser.add_argument("--pi3_env", type=str, default="sam3d-objects")
     parser.add_argument("--sam3d_env", type=str, default="sam3d-objects")
 
     args = parser.parse_args()
 
     # Resolve GPUs
+    from batch_utils import detect_gpu_ids
     if args.gpus:
         gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
     else:
-        gpu_ids = detect_gpus()
-
-    max_parallel = args.max_parallel or len(gpu_ids)
+        gpu_ids = detect_gpu_ids()
 
     if args.output_dir is None:
-        args.output_dir = os.path.join(SCRIPT_DIR, "batch_parallel_output")
+        args.output_dir = os.path.join(SCRIPT_DIR, "batch_output")
+    args.output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load episodes
-    if args.manifest:
-        episodes = load_manifest(args.manifest)
+    # Load input JSON
+    with open(args.input) as f:
+        input_data = json.load(f)
+
+    # Support both dict (with config) and bare list formats
+    if isinstance(input_data, list):
+        input_entries = input_data
+        ssv2_video_dir = None
+        epic_video_dir = None
+        json_recon_method = None
     else:
-        if args.ssv2_video_dir is None:
-            # Default to the old location if it exists, otherwise error
-            default_dir = os.path.join(PROJECT_ROOT, "VITRA", "20bn-something-something-v2")
-            if os.path.isdir(default_dir):
-                args.ssv2_video_dir = default_dir
-            else:
-                print("ERROR: --ssv2_video_dir is required with --annotations "
-                      "(directory containing SSv2 .webm/.mp4 files)")
-                sys.exit(1)
-        episodes = episodes_from_annotations(args.annotations, args.ssv2_video_dir)
+        input_entries = input_data["episodes"]
+        ssv2_video_dir = input_data.get("ssv2_video_dir")
+        epic_video_dir = input_data.get("epic_video_dir")
+        json_recon_method = input_data.get("recon_method")
+
+    # CLI flag overrides JSON; JSON overrides default
+    recon_method = args.recon_method or json_recon_method or "ttt3r"
+
+    # Resolve relative video dirs against the input JSON's directory
+    input_dir = os.path.dirname(os.path.abspath(args.input))
+    if ssv2_video_dir and not os.path.isabs(ssv2_video_dir):
+        ssv2_video_dir = os.path.join(input_dir, ssv2_video_dir)
+    if epic_video_dir and not os.path.isabs(epic_video_dir):
+        epic_video_dir = os.path.join(input_dir, epic_video_dir)
+
+    # Resolve episodes (auto-find videos, extract Epic clips)
+    print("Resolving episodes...")
+    episodes = resolve_episodes(
+        input_entries, args.output_dir,
+        ssv2_video_dir=ssv2_video_dir,
+        epic_video_dir=epic_video_dir,
+        base_dir=input_dir,
+    )
 
     if not episodes:
         print("ERROR: No videos to process.")
         sys.exit(1)
 
-    # Collect pipeline args to pass through
-    pipeline_args = {
-        "frame_interval": args.frame_interval,
-        "ttt3r_env": args.ttt3r_env,
-        "megasam_env": args.megasam_env,
-        "sam3d_env": args.sam3d_env,
-        "use_megasam": args.use_megasam,
-        "skip_reconstruction": args.skip_reconstruction,
-        "skip_scene_seg": args.skip_scene_seg,
-        "skip_sam3d": args.skip_sam3d,
-        "skip_combine": args.skip_combine,
-        "skip_visualizations": args.skip_visualizations,
-        "inference_steps": args.inference_steps,
-        "early_exit_score": args.early_exit_score,
-    }
-
     print("=" * 80)
     print("Multi-GPU Parallel Batch Processor")
     print("=" * 80)
-    print(f"Videos:        {len(episodes)}")
-    print(f"GPUs:          {gpu_ids} ({len(gpu_ids)} total)")
-    print(f"Max parallel:  {max_parallel}")
-    print(f"Output:        {args.output_dir}")
+    print(f"Videos:  {len(episodes)}")
+    print(f"Recon:   {recon_method}")
+    print(f"GPUs:    {gpu_ids} ({len(gpu_ids)} total)")
+    print(f"Output:  {args.output_dir}")
     print()
 
     # Print episode list
-    print(f"{'#':>3}  {'Video':>10}  Action")
-    print("-" * 60)
+    print(f"{'#':>3}  {'Video':>25}  Action")
+    print("-" * 70)
     for i, ep in enumerate(episodes):
-        print(f"{i+1:>3}  {ep['video_name']:>10}  {ep.get('action_text', '')}")
+        print(f"{i+1:>3}  {ep['video_name']:>25}  {ep.get('action_text', '')}")
     print()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Save manifest
+    # Save episode manifest (human-readable)
     manifest_path = os.path.join(args.output_dir, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(episodes, f, indent=2, default=str)
 
-    # Process videos in parallel across GPUs
-    results = []
+    # Build batch worker manifest
+    batch_manifest = []
+    for ep in episodes:
+        batch_manifest.append({
+            "video_path": ep["video_path"],
+            "output_dir": os.path.join(args.output_dir, ep["video_name"]),
+            "annotation_path": ep.get("annotation_path"),
+        })
+    batch_manifest_path = os.path.join(args.output_dir, "batch_manifest.json")
+    with open(batch_manifest_path, "w") as f:
+        json.dump(batch_manifest, f, indent=2)
+
+    # Run two-phase batch workers across GPUs
+    from batch_utils import run_batch_phases, collect_batch_results_raw
+
     batch_start = time.time()
-
-    if args.use_batch_worker:
-        # Batch worker mode: partition videos across GPUs, each GPU runs a
-        # persistent worker that loads models once
-        print("Using persistent batch workers (models loaded once per GPU)\n")
-        results = _run_with_batch_workers(
-            episodes, args.output_dir, gpu_ids, max_parallel, pipeline_args,
-        )
-    else:
-        # Standard mode: one subprocess per video
-        with ProcessPoolExecutor(max_workers=max_parallel) as executor:
-            # Submit all videos, cycling through GPUs
-            futures = {}
-            for i, episode in enumerate(episodes):
-                gpu_id = gpu_ids[i % len(gpu_ids)]
-                future = executor.submit(
-                    run_single_video, episode, args.output_dir, gpu_id, pipeline_args,
-                )
-                futures[future] = (i, episode)
-
-            # Collect results as they complete
-            for future in as_completed(futures):
-                idx, episode = futures[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    result = {
-                        "video_name": episode["video_name"],
-                        "action_text": episode.get("action_text", ""),
-                        "gpu_id": -1,
-                        "returncode": -1,
-                        "elapsed_seconds": 0,
-                        "output_dir": "",
-                        "error": str(e),
-                    }
-
-                results.append(result)
-                status = "OK" if result["returncode"] == 0 else f"FAIL (rc={result['returncode']})"
-                n_done = len(results)
-                print(f"[{n_done}/{len(episodes)}] GPU {result['gpu_id']}: "
-                      f"{result['video_name']} -> {status} ({result['elapsed_seconds']}s)")
-
+    run_batch_phases(
+        batch_manifest_path, args.output_dir, gpu_ids=gpu_ids,
+        ttt3r_env=args.ttt3r_env, sam3d_env=args.sam3d_env,
+        pi3_env=args.pi3_env, recon_method=recon_method,
+        frame_interval=args.frame_interval,
+        skip_reconstruction=args.skip_reconstruction,
+        skip_scene_seg=args.skip_scene_seg,
+        skip_sam3d=args.skip_sam3d, skip_combine=args.skip_combine,
+        skip_visualizations=args.skip_visualizations,
+    )
     batch_elapsed = time.time() - batch_start
 
-    # Sort results by video name for consistent display
-    results.sort(key=lambda r: r["video_name"])
+    # Collect results
+    ttt3r_results, sam3d_results = collect_batch_results_raw(args.output_dir)
+    results = []
+    for ep in episodes:
+        video_path = ep["video_path"]
+        ttt3r_r = ttt3r_results.get(video_path, {})
+        sam3d_r = sam3d_results.get(video_path, {})
+        success = sam3d_r.get("success", ttt3r_r.get("success", False))
+        elapsed = ttt3r_r.get("elapsed_s", 0) + sam3d_r.get("elapsed_s", 0)
+        results.append({
+            "video_name": ep["video_name"],
+            "action_text": ep.get("action_text", ""),
+            "returncode": 0 if success else 1,
+            "elapsed_seconds": round(elapsed, 1),
+            "output_dir": os.path.join(args.output_dir, ep["video_name"]),
+        })
 
     # Summary
     n_ok = sum(1 for r in results if r["returncode"] == 0)
@@ -491,17 +404,18 @@ def main():
     print("\n" + "=" * 80)
     print("BATCH COMPLETE")
     print("=" * 80)
-    print(f"\n{'#':>3}  {'Video':>10}  {'GPU':>3}  {'Status':>6}  {'Time':>7}  Action")
+    print(f"\n{'#':>3}  {'Video':>25}  {'Status':>6}  {'Time':>7}  Action")
     print("-" * 80)
     for i, r in enumerate(results):
         status = "OK" if r["returncode"] == 0 else "FAIL"
-        print(f"{i+1:>3}  {r['video_name']:>10}  {r['gpu_id']:>3}  {status:>6}  "
+        print(f"{i+1:>3}  {r['video_name']:>25}  {status:>6}  "
               f"{r['elapsed_seconds']:>6.1f}s  {r.get('action_text', '')}")
 
     print(f"\n{n_ok}/{len(results)} succeeded")
     print(f"Wall time:      {batch_elapsed:.1f}s ({batch_elapsed/60:.1f} min)")
-    print(f"Total CPU time: {total_video_time:.1f}s ({total_video_time/60:.1f} min)")
-    print(f"Speedup:        {total_video_time/max(batch_elapsed, 1):.1f}×")
+    print(f"Total GPU time: {total_video_time:.1f}s ({total_video_time/60:.1f} min)")
+    if batch_elapsed > 0:
+        print(f"Speedup:        {total_video_time/batch_elapsed:.1f}x")
     print(f"Output:         {args.output_dir}")
 
     # Save results
@@ -510,10 +424,8 @@ def main():
         "n_videos": len(results),
         "n_ok": n_ok,
         "gpus": gpu_ids,
-        "max_parallel": max_parallel,
         "wall_time_s": round(batch_elapsed, 1),
         "total_video_time_s": round(total_video_time, 1),
-        "speedup": round(total_video_time / max(batch_elapsed, 1), 1),
         "results": results,
     }
     with open(results_path, "w") as f:
@@ -524,4 +436,5 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
     main()

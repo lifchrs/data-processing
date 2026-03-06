@@ -6,7 +6,7 @@ End-to-end pipeline: Video + VITRA annotation → Scene reconstruction,
 scene segmentation, object detection/reconstruction, and combined point clouds.
 
 Steps:
-  1. Scene Reconstruction (TTT3R or MegaSAM) → depth, camera poses
+  1. Scene Reconstruction (TTT3R, MegaSAM, or Pi3) → depth, camera poses
   2. Scene Segmentation (SAM3 auto-mask + tracking) → per-frame label maps
   3. Object Detection + 3D Reconstruction (SAM3D) → per-object PLY + masks
   4. Combine into Point Cloud → final PLY files
@@ -18,8 +18,9 @@ Usage:
     python run_pipeline.py --video input.mp4 --output_dir results \\
         --vitra_annotation annotation.npy
 
-    # Using MegaSAM instead of TTT3R:
-    python run_pipeline.py --video input.mp4 --output_dir results --use_megasam
+    # Using a different reconstruction backend:
+    python run_pipeline.py --video input.mp4 --output_dir results --recon_method megasam
+    python run_pipeline.py --video input.mp4 --output_dir results --recon_method pi3
 """
 
 import argparse
@@ -212,6 +213,46 @@ def run_ttt3r(video_path, output_dir, frame_interval, device, ttt3r_env,
             f"\nTTT3R completed successfully!\nOutput saved to: {ttt3r_out}",
             output_dir=ttt3r_out, elapsed_s=elapsed, success=True)
     return ttt3r_out
+
+
+def run_pi3(video_path, output_dir, frame_interval, device, pi3_env,
+            pi3_ckpt=None, log=None):
+    """Run Pi3 scene reconstruction."""
+    log.log("step1_reconstruction",
+            "\n" + "=" * 80 + "\nSTEP 1/4: Running Pi3 Scene Reconstruction\n" + "=" * 80)
+
+    pi3_out = os.path.join(output_dir, "ttt3r_output")
+    os.makedirs(pi3_out, exist_ok=True)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    cmd = get_python_cmd(pi3_env) + [
+        os.path.join(script_dir, "run_pi3.py"),
+        "--video", video_path,
+        "--output_dir", pi3_out,
+        "--frame_interval", str(frame_interval),
+        "--device", device,
+    ]
+    if pi3_ckpt:
+        cmd.extend(["--ckpt", pi3_ckpt])
+
+    log.log("step1_reconstruction", f"Running: {' '.join(cmd)}\n",
+            command=cmd)
+
+    t0 = time.time()
+    result = subprocess.run(cmd, check=False, env=get_env_vars(pi3_env))
+    elapsed = time.time() - t0
+
+    if result.returncode != 0:
+        log.log("step1_reconstruction",
+                f"\nERROR: Pi3 failed with return code {result.returncode}",
+                returncode=result.returncode, elapsed_s=elapsed, success=False)
+        sys.exit(1)
+
+    log.log("step1_reconstruction",
+            f"\nPi3 completed successfully!\nOutput saved to: {pi3_out}",
+            output_dir=pi3_out, elapsed_s=elapsed, success=True)
+    return pi3_out
 
 
 def run_megasam(video_path, output_dir, frame_interval, device, megasam_env,
@@ -529,8 +570,9 @@ Examples:
   python run_pipeline.py --video input.mp4 --output_dir results \\
       --vitra_annotation annotation.npy
 
-  # Using MegaSAM instead of TTT3R
-  python run_pipeline.py --video input.mp4 --output_dir results --use_megasam
+  # Using MegaSAM or Pi3 instead of TTT3R
+  python run_pipeline.py --video input.mp4 --output_dir results --recon_method megasam
+  python run_pipeline.py --video input.mp4 --output_dir results --recon_method pi3
 
   # Skip steps to reuse existing outputs
   python run_pipeline.py --video input.mp4 --output_dir results \\
@@ -547,8 +589,9 @@ Examples:
     # Optional
     parser.add_argument("--vitra_annotation", type=str, default=None,
                         help="Path to VITRA .npy annotation (enables hand_point detection)")
-    parser.add_argument("--use_megasam", action="store_true",
-                        help="Use MegaSAM instead of TTT3R (default: TTT3R)")
+    parser.add_argument("--recon_method", type=str, default="ttt3r",
+                        choices=["ttt3r", "megasam", "pi3"],
+                        help="Scene reconstruction method (default: ttt3r)")
     parser.add_argument("--skip_reconstruction", action="store_true",
                         help="Skip step 1 (reuse existing ttt3r_output)")
     parser.add_argument("--skip_scene_seg", action="store_true",
@@ -586,6 +629,8 @@ Examples:
                         help="Conda environment for TTT3R (default: ttt3r)")
     parser.add_argument("--megasam_env", type=str, default="mega_sam",
                         help="Conda environment for MegaSAM (default: mega_sam)")
+    parser.add_argument("--pi3_env", type=str, default="sam3d-objects",
+                        help="Conda environment for Pi3 (default: sam3d-objects)")
     parser.add_argument("--sam3d_env", type=str, default="sam3d-objects",
                         help="Conda environment for SAM3D and scene seg (default: sam3d-objects)")
 
@@ -595,6 +640,8 @@ Examples:
                         help="Path to TTT3R model checkpoint")
     parser.add_argument("--img_size", type=int, default=512,
                         help="Input image size for TTT3R (default: 512)")
+    parser.add_argument("--pi3_ckpt", type=str, default=None,
+                        help="Path to Pi3X checkpoint (default: auto-download from HuggingFace)")
 
     # Undistortion
     parser.add_argument("--intrinsics_root", type=str, default=None,
@@ -689,7 +736,7 @@ def main():
     log = PipelineLog(verbose=args.verbose)
     pipeline_start = time.time()
 
-    backend = "MegaSAM" if args.use_megasam else "TTT3R"
+    backend = {"ttt3r": "TTT3R", "megasam": "MegaSAM", "pi3": "Pi3"}[args.recon_method]
     log.log("config",
             "=" * 80 + "\nUnified Video Pipeline\n" + "=" * 80
             + f"\nInput video:       {args.video}"
@@ -719,8 +766,10 @@ def main():
     # Check required conda environments
     envs_to_check = []
     if not args.skip_reconstruction:
-        if args.use_megasam:
+        if args.recon_method == "megasam":
             envs_to_check.append(("MegaSAM", args.megasam_env))
+        elif args.recon_method == "pi3":
+            envs_to_check.append(("Pi3", args.pi3_env))
         else:
             envs_to_check.append(("TTT3R", args.ttt3r_env))
     if not args.skip_scene_seg or not args.skip_sam3d or not args.skip_combine:
@@ -767,10 +816,16 @@ def main():
         log.log("parallel", "\nRunning Steps 1 & 2 in parallel...")
 
         def _do_step1():
-            if args.use_megasam:
+            if args.recon_method == "megasam":
                 return run_megasam(
                     effective_video, args.output_dir, args.frame_interval,
                     args.device, args.megasam_env, log=log,
+                )
+            elif args.recon_method == "pi3":
+                return run_pi3(
+                    effective_video, args.output_dir, args.frame_interval,
+                    args.device, args.pi3_env, pi3_ckpt=args.pi3_ckpt,
+                    log=log,
                 )
             else:
                 return run_ttt3r(
@@ -802,10 +857,16 @@ def main():
                         f"ERROR: Reconstruction output not found: {ttt3r_out}",
                         error="output_not_found")
                 sys.exit(1)
-        elif args.use_megasam:
+        elif args.recon_method == "megasam":
             ttt3r_out = run_megasam(
                 effective_video, args.output_dir, args.frame_interval,
                 args.device, args.megasam_env, log=log,
+            )
+        elif args.recon_method == "pi3":
+            ttt3r_out = run_pi3(
+                effective_video, args.output_dir, args.frame_interval,
+                args.device, args.pi3_env, pi3_ckpt=args.pi3_ckpt,
+                log=log,
             )
         else:
             ttt3r_out = run_ttt3r(

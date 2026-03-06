@@ -7,7 +7,10 @@ videos to avoid repeated model initialization overhead (~30-60s per video).
 
 Two modes:
   - TTT3R mode:  Loads TTT3R model once, processes all videos for Step 1.
-  - SAM3D mode:  Loads SAM3 + Inference models once, processes Steps 2-4 for all videos.
+                 Runs undistortion (Ego4D/EgoExo4D) before each video.
+  - SAM3D mode:  Loads SAM3 + Inference models once, processes Steps 3-4 for all videos.
+                 Auto-derives frames_dir/camera_dir from ttt3r_output if not in manifest.
+                 Runs quality flags check after Step 3.
 
 Usage (run from the appropriate conda env):
 
@@ -23,8 +26,8 @@ Manifest format: JSON list of dicts:
             "video_path": "/path/to/video.mp4",
             "output_dir": "/path/to/output",
             "annotation_path": "/path/to/annotation.npy",  // optional
-            "frames_dir": "/path/to/frames",                // optional, for SAM3D
-            "camera_dir": "/path/to/cameras",               // required for SAM3D
+            "frames_dir": "/path/to/frames",                // optional, auto-derived from ttt3r_output
+            "camera_dir": "/path/to/cameras",               // optional, auto-derived from ttt3r_output
             "prompt": "object held in hand"                  // optional
         },
         ...
@@ -38,6 +41,7 @@ with a different slice of the manifest.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -45,12 +49,103 @@ import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
+# Datasets where video_decode_frame contains absolute frame indices from the
+# full source video, NOT relative to the clip we actually process.  For these
+# datasets the pipeline works on a short extracted clip, so vdf must be rebased
+# to clip-relative indices (subtract vdf[0]).
+_ABSOLUTE_VDF_DATASETS = {"epic", "ego4d", "egoexo4d"}
+
+
+def _detect_dataset(annotation_path):
+    """Determine the source dataset from an annotation filename prefix."""
+    if not annotation_path:
+        return None
+    basename = os.path.basename(annotation_path)
+    for prefix, dataset in [
+        ("somethingsomethingv2_", "ssv2"),
+        ("epic_kitchens_", "epic"),
+        ("EgoExo4D_", "egoexo4d"),
+        ("Ego4D_", "ego4d"),
+    ]:
+        if basename.startswith(prefix):
+            return dataset
+    return None
+
+
+def _rebase_vdf(vdf, annotation_path):
+    """Rebase video_decode_frame to clip-relative indices if needed.
+
+    For datasets like Epic-Kitchens, vdf contains absolute frame indices from
+    the full source video (e.g., 84849).  When we process a pre-extracted clip,
+    these must be rebased to start from 0.
+    """
+    dataset = _detect_dataset(annotation_path)
+    if dataset in _ABSOLUTE_VDF_DATASETS:
+        return vdf - vdf[0]
+    return vdf
+
+
+def _rename_ttt3r_outputs(ttt3r_out, offset, n_frames):
+    """Rename sequential TTT3R output files to original video frame indices.
+
+    prepare_output saves files as 000000, 000001, ... but when we clipped
+    the input to a subrange starting at `offset`, file 000000 actually
+    corresponds to video frame `offset`.  Rename in reverse order to avoid
+    collisions (target indices are always >= source indices).
+    """
+    for subdir in ["depth", "conf", "color", "camera"]:
+        d = os.path.join(ttt3r_out, subdir)
+        if not os.path.isdir(d):
+            continue
+        # Rename in reverse to avoid collisions
+        for seq_idx in range(n_frames - 1, -1, -1):
+            orig_idx = seq_idx + offset
+            if seq_idx == orig_idx:
+                continue
+            ext = ".png" if subdir == "color" else (".npz" if subdir == "camera" else ".npy")
+            src = os.path.join(d, f"{seq_idx:06d}{ext}")
+            dst = os.path.join(d, f"{orig_idx:06d}{ext}")
+            if os.path.exists(src):
+                os.rename(src, dst)
+
+
+def _run_undistortion(video_path, annotation_path, output_dir, intrinsics_root=None):
+    """Run undistortion as subprocess if needed. Returns effective video path."""
+    if not annotation_path or not os.path.exists(annotation_path):
+        return video_path
+
+    undistorted_path = os.path.join(output_dir, "undistorted_video.mp4")
+    if os.path.exists(undistorted_path):
+        return undistorted_path  # already undistorted
+
+    cmd = [
+        sys.executable,
+        os.path.join(SCRIPT_DIR, "undistort_clip.py"),
+        "--video", os.path.abspath(video_path),
+        "--annotation", os.path.abspath(annotation_path),
+        "--output", os.path.abspath(undistorted_path),
+    ]
+    if intrinsics_root:
+        cmd.extend(["--intrinsics_root", os.path.abspath(intrinsics_root)])
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print(f"  WARNING: Undistortion failed: {result.stderr[:200]}")
+        return video_path
+
+    for line in result.stdout.splitlines():
+        if line.startswith("USE_VIDEO="):
+            return line.split("=", 1)[1].strip()
+
+    return video_path
+
 
 # ---------------------------------------------------------------------------
 # TTT3R Batch Worker
 # ---------------------------------------------------------------------------
 
-def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval):
+def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
+                    intrinsics_root=None):
     """Load TTT3R model once and process all videos."""
     # Add TTT3R to path
     ttt3r_dir = os.path.join(PROJECT_ROOT, "TTT3R")
@@ -78,8 +173,16 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval):
     for i, entry in enumerate(manifest):
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
+        annotation_path = entry.get("annotation_path")
         ttt3r_out = os.path.join(output_dir, "ttt3r_output")
         os.makedirs(ttt3r_out, exist_ok=True)
+
+        # Skip if already processed
+        depth_out = os.path.join(ttt3r_out, "depth")
+        if os.path.isdir(depth_out) and os.listdir(depth_out):
+            print(f"\n[{i+1}/{len(manifest)}] Skipping (already done): {video_path}")
+            results.append({"video": video_path, "success": True, "skipped": True})
+            continue
 
         print(f"\n[{i+1}/{len(manifest)}] Processing: {video_path}")
         t_start = time.time()
@@ -87,12 +190,45 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval):
         try:
             import shutil
 
+            # Clean up partial output from previous runs
+            if os.path.isdir(ttt3r_out):
+                for sub in os.listdir(ttt3r_out):
+                    sub_path = os.path.join(ttt3r_out, sub)
+                    if os.path.isdir(sub_path):
+                        shutil.rmtree(sub_path)
+
+            # Undistort if needed (Ego4D/EgoExo4D)
+            effective_video = _run_undistortion(
+                video_path, annotation_path, output_dir, intrinsics_root)
+            if effective_video != video_path:
+                print(f"  Using undistorted video: {effective_video}")
+
             # Prepare input frames
-            img_paths, tmpdirname = parse_seq_path(video_path, frame_interval)
+            img_paths, tmpdirname = parse_seq_path(effective_video, frame_interval)
             if not img_paths:
                 print(f"  No images found, skipping")
                 results.append({"video": video_path, "success": False, "error": "no_frames"})
                 continue
+
+            # Clip to VITRA annotation range + margin to avoid processing
+            # unnecessary frames (VITRA episodes are often subclips)
+            clip_offset = 0
+            if annotation_path and os.path.exists(annotation_path):
+                import numpy as np
+                annot = np.load(annotation_path, allow_pickle=True).item()
+                vdf = annot.get('video_decode_frame')
+                if vdf is not None and len(vdf) > 0:
+                    margin = 3
+                    vdf = _rebase_vdf(vdf, annotation_path)
+                    first_idx = vdf[0] // frame_interval
+                    last_idx = vdf[-1] // frame_interval
+                    clip_start = max(0, first_idx - margin)
+                    clip_end = min(len(img_paths) - 1, last_idx + margin)
+                    n_before = len(img_paths)
+                    img_paths = img_paths[clip_start:clip_end + 1]
+                    clip_offset = clip_start
+                    print(f" - Clipping to VITRA range: frames {clip_start}-{clip_end} "
+                          f"({len(img_paths)}/{n_before} frames)")
 
             img_mask = [True] * len(img_paths)
             views = prepare_input(
@@ -111,6 +247,10 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval):
             # Save outputs
             prepare_output(outputs, ttt3r_out, 1, True)
 
+            # Rename sequential outputs to original video frame indices
+            if clip_offset > 0:
+                _rename_ttt3r_outputs(ttt3r_out, clip_offset, len(img_paths))
+
             elapsed = time.time() - t_start
             print(f"  Done in {elapsed:.1f}s")
             results.append({"video": video_path, "success": True, "elapsed_s": round(elapsed, 1)})
@@ -125,15 +265,188 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval):
 
 
 # ---------------------------------------------------------------------------
+# Pi3 Batch Worker
+# ---------------------------------------------------------------------------
+
+def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
+                  intrinsics_root=None):
+    """Load Pi3 model once and process all videos."""
+    import torch
+
+    pi3_dir = os.path.join(PROJECT_ROOT, "Pi3")
+    sys.path.insert(0, pi3_dir)
+
+    from pi3.utils.basic import load_images_as_tensor
+    from pi3.models.pi3x import Pi3X
+
+    # Load model once
+    print(f"Loading Pi3X model...")
+    t0 = time.time()
+    if pi3_ckpt is not None:
+        model = Pi3X(use_multimodal=False).eval()
+        if pi3_ckpt.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            weight = load_file(pi3_ckpt)
+        else:
+            weight = torch.load(pi3_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(weight, strict=False)
+    else:
+        model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
+        model.disable_multimodal()
+    model = model.to(device)
+    print(f"Model loaded in {time.time() - t0:.1f}s")
+
+    dtype = torch.bfloat16 if (device != "cpu" and
+            torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+
+    results = []
+    for i, entry in enumerate(manifest):
+        video_path = entry["video_path"]
+        output_dir = entry["output_dir"]
+        annotation_path = entry.get("annotation_path")
+        pi3_out = os.path.join(output_dir, "ttt3r_output")
+        os.makedirs(pi3_out, exist_ok=True)
+
+        # Skip if already processed
+        depth_out = os.path.join(pi3_out, "depth")
+        if os.path.isdir(depth_out) and os.listdir(depth_out):
+            print(f"\n[{i+1}/{len(manifest)}] Skipping (already done): {video_path}")
+            results.append({"video": video_path, "success": True, "skipped": True})
+            continue
+
+        print(f"\n[{i+1}/{len(manifest)}] Processing: {video_path}")
+        t_start = time.time()
+
+        try:
+            import shutil
+            import cv2
+            import numpy as np
+
+            # Clean up partial output
+            if os.path.isdir(pi3_out):
+                for sub in os.listdir(pi3_out):
+                    sub_path = os.path.join(pi3_out, sub)
+                    if os.path.isdir(sub_path):
+                        shutil.rmtree(sub_path)
+
+            # Undistort if needed
+            effective_video = _run_undistortion(
+                video_path, annotation_path, output_dir, intrinsics_root)
+            if effective_video != video_path:
+                print(f"  Using undistorted video: {effective_video}")
+
+            # Create output dirs
+            depth_dir = os.path.join(pi3_out, "depth")
+            color_dir = os.path.join(pi3_out, "color")
+            camera_dir = os.path.join(pi3_out, "camera")
+            for d in [depth_dir, color_dir, camera_dir]:
+                os.makedirs(d, exist_ok=True)
+
+            # Load frames
+            imgs = load_images_as_tensor(effective_video, interval=frame_interval).to(device)
+            N, C, H, W = imgs.shape
+
+            # Load original-resolution frames for color output
+            orig_frames = []
+            cap = cv2.VideoCapture(effective_video)
+            frame_idx = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx % frame_interval == 0:
+                    orig_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                frame_idx += 1
+            cap.release()
+            orig_frames = orig_frames[:N]
+
+            # Clip to VITRA range if available
+            clip_offset = 0
+            if annotation_path and os.path.exists(annotation_path):
+                annot = np.load(annotation_path, allow_pickle=True).item()
+                vdf = annot.get('video_decode_frame')
+                if vdf is not None and len(vdf) > 0:
+                    margin = 3
+                    vdf = _rebase_vdf(vdf, annotation_path)
+                    first_idx = vdf[0] // frame_interval
+                    last_idx = vdf[-1] // frame_interval
+                    clip_start = max(0, first_idx - margin)
+                    clip_end = min(N - 1, last_idx + margin)
+                    n_before = N
+                    imgs = imgs[clip_start:clip_end + 1]
+                    orig_frames = orig_frames[clip_start:clip_end + 1]
+                    clip_offset = clip_start
+                    N = imgs.shape[0]
+                    print(f"  Clipping to VITRA range: frames {clip_start}-{clip_end} "
+                          f"({N}/{n_before} frames)")
+
+            # Run inference
+            with torch.no_grad():
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    res = model(imgs[None])
+
+            local_points = res['local_points'][0].cpu().numpy()
+            camera_poses = res['camera_poses'][0].cpu().numpy()
+            conf = res['conf'][0].cpu().numpy()
+
+            # Derive intrinsics
+            from run_pi3 import derive_intrinsics
+            K = derive_intrinsics(local_points, conf)
+
+            # Save per-frame outputs
+            for fi in range(N):
+                frame_num = (fi + clip_offset) * frame_interval
+                basename = f"{frame_num:06d}"
+
+                depth = local_points[fi, :, :, 2].copy()
+                c = 1.0 / (1.0 + np.exp(-conf[fi, :, :, 0]))
+                depth[c < 0.1] = 0
+                depth[depth < 0] = 0
+                np.save(os.path.join(depth_dir, f"{basename}.npy"),
+                        depth.astype(np.float32))
+
+                np.savez(os.path.join(camera_dir, f"{basename}.npz"),
+                         pose=camera_poses[fi].astype(np.float64),
+                         intrinsics=K.astype(np.float64))
+
+                if fi < len(orig_frames):
+                    color = orig_frames[fi]
+                    if color.shape[0] != H or color.shape[1] != W:
+                        color = cv2.resize(color, (W, H))
+                    cv2.imwrite(os.path.join(color_dir, f"{basename}.png"),
+                                cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
+
+            elapsed = time.time() - t_start
+            print(f"  Done in {elapsed:.1f}s ({N} frames)")
+            results.append({"video": video_path, "success": True,
+                            "elapsed_s": round(elapsed, 1)})
+
+        except Exception as e:
+            import traceback
+            elapsed = time.time() - t_start
+            print(f"  FAILED: {e}")
+            traceback.print_exc()
+            results.append({"video": video_path, "success": False,
+                            "error": str(e), "elapsed_s": round(elapsed, 1)})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # SAM3D Batch Worker (Steps 2-4: Scene Seg + Object Detection + Combine)
 # ---------------------------------------------------------------------------
 
 def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
-                    skip_sam3d=False, skip_combine=False, skip_visualizations=False):
-    """Load SAM3 models once and process all videos for steps 2-4."""
+                    skip_sam3d=False, skip_combine=False, skip_visualizations=False,
+                    intrinsics_root=None):
+    """Load SAM3 models once and process all videos for steps 3-4."""
     import torch
     import numpy as np
     from PIL import Image
+
+    # Import quality flags checker
+    sys.path.insert(0, SCRIPT_DIR)
+    from run_pipeline import check_quality_flags
 
     # Set up SAM3D imports
     sam3d_root = os.path.join(PROJECT_ROOT, "sam-3d-objects")
@@ -168,9 +481,19 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
         annotation_path = entry.get("annotation_path")
-        frames_dir = entry.get("frames_dir")
-        camera_dir = entry.get("camera_dir")
+        ttt3r_out = os.path.join(output_dir, "ttt3r_output")
+        frames_dir = entry.get("frames_dir") or os.path.join(ttt3r_out, "color")
+        camera_dir = entry.get("camera_dir") or os.path.join(ttt3r_out, "camera")
         prompt = entry.get("prompt", "object held in either hand")
+
+        # Skip if final output already exists
+        ply_out = os.path.join(output_dir, "ply_output")
+        if os.path.isdir(ply_out) and any(
+            f.endswith(".ply") for f in os.listdir(ply_out)
+        ):
+            print(f"\n[{i+1}/{len(manifest)}] Skipping (already done): {os.path.basename(output_dir)}")
+            results.append({"video": video_path, "success": True, "skipped": True})
+            continue
 
         print(f"\n{'='*60}")
         print(f"[{i+1}/{len(manifest)}] Processing: {os.path.basename(video_path)}")
@@ -178,6 +501,11 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
         t_start = time.time()
 
         try:
+            # --- Metric rescaling ---
+            if annotation_path and os.path.exists(annotation_path):
+                from rescale_to_metric import rescale_ttt3r_to_metric
+                rescale_ttt3r_to_metric(ttt3r_out, annotation_path)
+
             # --- Step 3: SAM3D Object Detection + Reconstruction ---
             if not skip_sam3d:
                 sam3d_out = os.path.join(output_dir, "sam3d_output")
@@ -200,9 +528,30 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
                 if not os.path.exists(sam3d_out):
                     sam3d_out = None
 
+            # --- Quality flags ---
+            action_text = prompt
+            if annotation_path and os.path.exists(annotation_path):
+                try:
+                    annotation = np.load(annotation_path, allow_pickle=True).item()
+                    text_data = annotation.get('text', {})
+                    for hand in ['left', 'right']:
+                        actions = text_data.get(hand, [])
+                        if actions:
+                            action_text = actions[0][0]
+                            break
+                except Exception:
+                    pass
+
+            episode_id = None
+            if annotation_path:
+                episode_id = os.path.splitext(os.path.basename(annotation_path))[0]
+            check_quality_flags(
+                output_dir, sam3d_out, action_text,
+                episode_id=episode_id, sam3d_skipped=skip_sam3d,
+            )
+
             # --- Step 4: Combine outputs ---
             if not skip_combine:
-                ttt3r_out = os.path.join(output_dir, "ttt3r_output")
                 _run_combine_single(
                     ttt3r_out=ttt3r_out,
                     sam3d_out=sam3d_out,
@@ -239,11 +588,17 @@ def _run_sam3d_single(model, processor, inference_model,
     from text_utils import extract_object_noun
 
     # Load video frames
+    # frame_index_map: list position → original video frame number
+    frame_index_map = None
     if frames_dir is not None:
         import glob as _glob
         frame_paths = sorted(_glob.glob(os.path.join(frames_dir, "*.png"))
                              + _glob.glob(os.path.join(frames_dir, "*.jpg")))
         video_frames = [Image.open(p).convert("RGB") for p in frame_paths]
+        # Extract original frame indices from filenames (e.g., 000007.png → 7)
+        frame_index_map = [
+            int(os.path.splitext(os.path.basename(p))[0]) for p in frame_paths
+        ]
     else:
         from transformers.video_utils import load_video
         try:
@@ -288,6 +643,28 @@ def _run_sam3d_single(model, processor, inference_model,
                     break
 
         if hand_joints is not None and intrinsics is not None:
+            # Remap VITRA-indexed hand data to video_frames list positions.
+            # VITRA index i corresponds to video frame video_decode_frame[i].
+            # video_frames list position j corresponds to video frame frame_index_map[j].
+            # We need hand_joints/kept_frames indexed by list position j.
+            vdf = annotation.get('video_decode_frame')
+            if vdf is not None and frame_index_map is not None:
+                vdf = _rebase_vdf(vdf, annotation_path)
+                frame_num_to_pos = {fn: pos for pos, fn in enumerate(frame_index_map)}
+                n_list = len(video_frames)
+                remapped_joints = np.zeros((n_list, hand_joints.shape[1], hand_joints.shape[2]))
+                remapped_kept = np.zeros(n_list, dtype=int)
+                for vi, vf in enumerate(vdf):
+                    if vi < len(hand_joints) and vf in frame_num_to_pos:
+                        pos = frame_num_to_pos[vf]
+                        remapped_joints[pos] = hand_joints[vi]
+                        if kept_frames is not None and vi < len(kept_frames):
+                            remapped_kept[pos] = kept_frames[vi]
+                        else:
+                            remapped_kept[pos] = 1
+                hand_joints = remapped_joints
+                kept_frames = remapped_kept
+
             detection_strategy = "hand_point"
             detection_kwargs.update({
                 "hand_joints": hand_joints,
@@ -327,7 +704,7 @@ def _run_sam3d_single(model, processor, inference_model,
 
     # Import reconstruction helpers
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "sam-3d-objects", "sam3d_objects"))
-    from track_objects import load_camera_pose, apply_pose_to_gaussian, gaussian_to_world
+    from track_objects import load_camera_pose, apply_pose_to_gaussian, transform_gaussian_to_world
 
     # Reconstruct objects
     for frame_idx in frames_to_process:
@@ -343,25 +720,26 @@ def _run_sam3d_single(model, processor, inference_model,
             if mask_tensor.sum() > 0:
                 mask_np = mask_tensor.cpu().numpy().astype(bool)
 
-                print(f"  Reconstructing Object {obj_idx} frame {frame_idx}")
+                # Map list-position frame_idx to original video frame number
+                orig_frame = frame_index_map[frame_idx] if frame_index_map else frame_idx
+                print(f"  Reconstructing Object {obj_idx} frame {orig_frame}")
                 output = inference_model(image_np, mask_np, seed=42)
 
-                ttt3r_idx = frame_idx // stride
+                ttt3r_idx = orig_frame // stride
                 camera_to_world, cam_intrinsics = load_camera_pose(ttt3r_idx, camera_dir)
 
                 obj_dir = os.path.join(output_dir, f"object_{obj_idx}")
                 os.makedirs(obj_dir, exist_ok=True)
 
-                from track_objects import apply_pose_to_gaussian, gaussian_to_world, save_gaussian_splat
                 gs_camera = apply_pose_to_gaussian(
                     output['gs'], output['rotation'], output['translation'],
                     output['scale'], flip_facing=False,
                 )
-                gs_world = gaussian_to_world(gs_camera, camera_to_world)
-                ply_path = os.path.join(obj_dir, f"frame_{frame_idx:04d}.ply")
-                save_gaussian_splat(gs_world, ply_path)
+                gs_world = transform_gaussian_to_world(gs_camera, camera_to_world)
+                ply_path = os.path.join(obj_dir, f"frame_{orig_frame:04d}.ply")
+                gs_world.save_ply(ply_path)
 
-                mask_path = os.path.join(obj_dir, f"frame_{frame_idx:04d}_mask.npy")
+                mask_path = os.path.join(obj_dir, f"frame_{orig_frame:04d}_mask.npy")
                 np.save(mask_path, mask_np)
 
                 print(f"  Saved: {ply_path}")
@@ -370,7 +748,6 @@ def _run_sam3d_single(model, processor, inference_model,
 def _run_combine_single(ttt3r_out, sam3d_out, output_dir, frame_interval,
                         annotation_path, skip_visualizations):
     """Run the combine step as a subprocess (it's fast, not worth deep integration)."""
-    import subprocess
 
     ply_out = os.path.join(output_dir, "ply_output")
     os.makedirs(ply_out, exist_ok=True)
@@ -401,8 +778,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Persistent batch worker: load models once, process multiple videos",
     )
-    parser.add_argument("--mode", choices=["ttt3r", "sam3d"], required=True,
-                        help="Worker mode: 'ttt3r' for Step 1, 'sam3d' for Steps 2-4")
+    parser.add_argument("--mode", choices=["ttt3r", "pi3", "sam3d"], required=True,
+                        help="Worker mode: 'ttt3r'/'pi3' for Step 1, 'sam3d' for Steps 2-4")
     parser.add_argument("--manifest", type=str, required=True,
                         help="Path to JSON manifest file listing videos to process")
 
@@ -412,6 +789,10 @@ def main():
                         help="TTT3R model checkpoint path")
     parser.add_argument("--img_size", type=int, default=512)
 
+    # Pi3 options
+    parser.add_argument("--pi3_ckpt", type=str, default=None,
+                        help="Pi3X checkpoint path (default: auto-download)")
+
     # Common options
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--frame_interval", type=int, default=1)
@@ -419,6 +800,10 @@ def main():
     parser.add_argument("--skip_sam3d", action="store_true")
     parser.add_argument("--skip_combine", action="store_true")
     parser.add_argument("--skip_visualizations", action="store_true")
+    parser.add_argument("--intrinsics_root", type=str, default=None,
+                        help="Root dir for intrinsics (ego4d/*.npy, egoexo4d/*.json)")
+    parser.add_argument("--results_file", type=str, default=None,
+                        help="Path to write results JSON (default: {manifest_dir}/batch_{mode}_results.json)")
 
     args = parser.parse_args()
 
@@ -435,6 +820,13 @@ def main():
     if args.mode == "ttt3r":
         results = run_ttt3r_batch(
             manifest, args.model_path, args.img_size, args.device, args.frame_interval,
+            intrinsics_root=args.intrinsics_root,
+        )
+    elif args.mode == "pi3":
+        results = run_pi3_batch(
+            manifest, args.device, args.frame_interval,
+            pi3_ckpt=args.pi3_ckpt,
+            intrinsics_root=args.intrinsics_root,
         )
     else:
         results = run_sam3d_batch(
@@ -443,6 +835,7 @@ def main():
             skip_sam3d=args.skip_sam3d,
             skip_combine=args.skip_combine,
             skip_visualizations=args.skip_visualizations,
+            intrinsics_root=args.intrinsics_root,
         )
 
     total = time.time() - t0
@@ -453,7 +846,10 @@ def main():
     print(f"{'='*60}")
 
     # Save results
-    results_path = os.path.join(os.path.dirname(args.manifest), f"batch_{args.mode}_results.json")
+    if args.results_file:
+        results_path = args.results_file
+    else:
+        results_path = os.path.join(os.path.dirname(args.manifest), f"batch_{args.mode}_results.json")
     with open(results_path, "w") as f:
         json.dump({"results": results, "total_s": round(total, 1), "n_ok": n_ok}, f, indent=2)
     print(f"Results saved to: {results_path}")

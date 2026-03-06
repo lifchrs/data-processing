@@ -785,104 +785,28 @@ def main():
 
     print(f"Found {len(depth_files)} frames.")
 
-    # Pre-compute a global scale factor by comparing hand size in metric (VITRA) vs
-    # TTT3R space.  For each valid frame we project VITRA joint pairs to 2D, read
-    # TTT3R depth at those pixels, unproject into TTT3R camera space, and compare
-    # the 3D distance to the known metric distance from joints_camspace.
-    # Joint pairs: wrist(0) ↔ each fingertip (4,8,12,16,20).
-    global_hand_scale = None
+    # Check if TTT3R output has been rescaled to metric
+    metric_scale_path = os.path.join(args.ttt3r_out, ".metric_scale")
+    is_metric = os.path.exists(metric_scale_path)
+    if is_metric:
+        print("TTT3R output is metric-scaled (hand scaling disabled)")
     vitra_intrinsics = vitra_ann.get('intrinsics', None) if vitra_ann is not None else None
-    if vitra_ann is not None and mano_data is not None:
-        vitra_frame_indices = vitra_ann.get('video_decode_frame', np.arange(100))
-        scale_samples = []
-        joint_pairs = [(0, 4), (0, 8), (0, 12), (0, 16), (0, 20)]  # wrist ↔ fingertips
-        for hand_name in ['right', 'left']:
-            if hand_name not in vitra_ann:
-                continue
-            vitra_hand = vitra_ann[hand_name]
-            if 'joints_camspace' not in vitra_hand:
-                continue
-            for vi, vf in enumerate(vitra_frame_indices):
-                if not vitra_hand['kept_frames'][vi]:
-                    continue
-                ref_depth_path = os.path.join(depth_dir, f"{vf:06d}.npy")
-                ref_cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
-                if not os.path.exists(ref_depth_path) or not os.path.exists(ref_cam_path):
-                    continue
-                ref_depth = np.load(ref_depth_path)
-                ref_cam = np.load(ref_cam_path)
-                ttt3r_K = ref_cam['intrinsics']
-                H_d, W_d = ref_depth.shape
 
-                # Build projection matrix: VITRA intrinsics scaled to depth map resolution
-                if vitra_intrinsics is not None:
-                    vitra_W = int(round(2 * vitra_intrinsics[0, 2]))
-                    vitra_H = int(round(2 * vitra_intrinsics[1, 2]))
-                    proj_fx = vitra_intrinsics[0, 0] * W_d / vitra_W
-                    proj_fy = vitra_intrinsics[1, 1] * H_d / vitra_H
-                    proj_cx = vitra_intrinsics[0, 2] * W_d / vitra_W
-                    proj_cy = vitra_intrinsics[1, 2] * H_d / vitra_H
-                else:
-                    proj_fx, proj_fy = ttt3r_K[0, 0], ttt3r_K[1, 1]
-                    proj_cx, proj_cy = ttt3r_K[0, 2], ttt3r_K[1, 2]
-
-                joints_metric = vitra_hand['joints_camspace'][vi]  # (21, 3) metric
-
-                for ja, jb in joint_pairs:
-                    # Metric 3D distance between joint pair
-                    metric_dist = np.linalg.norm(joints_metric[ja] - joints_metric[jb])
-                    if metric_dist < 0.01:  # skip degenerate
-                        continue
-
-                    # Project both joints to 2D
-                    pts_ok = True
-                    ttt3r_pts = []
-                    for jidx in [ja, jb]:
-                        pt = joints_metric[jidx]
-                        if pt[2] <= 0:
-                            pts_ok = False
-                            break
-                        u = proj_fx * pt[0] / pt[2] + proj_cx
-                        v = proj_fy * pt[1] / pt[2] + proj_cy
-                        # Skip if outside image with margin
-                        if u < 5 or u >= W_d - 5 or v < 5 or v >= H_d - 5:
-                            pts_ok = False
-                            break
-                        ui, vi_ = int(round(u)), int(round(v))
-                        d = ref_depth[vi_, ui]
-                        if d <= 0:
-                            pts_ok = False
-                            break
-                        # Unproject using TTT3R intrinsics
-                        x3 = (ui - ttt3r_K[0, 2]) * d / ttt3r_K[0, 0]
-                        y3 = (vi_ - ttt3r_K[1, 2]) * d / ttt3r_K[1, 1]
-                        ttt3r_pts.append(np.array([x3, y3, d]))
-
-                    if not pts_ok or len(ttt3r_pts) != 2:
-                        continue
-
-                    ttt3r_dist = np.linalg.norm(ttt3r_pts[0] - ttt3r_pts[1])
-                    if ttt3r_dist > 0:
-                        scale_samples.append(ttt3r_dist / metric_dist)
-
-        if len(scale_samples) > 0:
-            # IQR outlier filtering — remove samples outside 1.5×IQR
-            arr = np.array(scale_samples)
-            q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
-            iqr = q3 - q1
-            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-            filtered = arr[(arr >= lo) & (arr <= hi)]
-            if len(filtered) > 0:
-                global_hand_scale = float(np.median(filtered))
-                print(f"Global hand scale: {global_hand_scale:.4f} "
-                      f"(median of {len(filtered)}/{len(scale_samples)} samples after IQR filter, "
-                      f"range [{filtered.min():.4f}, {filtered.max():.4f}])")
-            else:
-                global_hand_scale = float(np.median(arr))
-                print(f"Global hand scale: {global_hand_scale:.4f} "
-                      f"(median of {len(arr)} samples, IQR filter removed all — using raw)")
-        else:
-            print("WARNING: Could not compute global hand scale (no valid hand+depth overlap)")
+    # Filter out margin frames (frames outside the VITRA annotation range)
+    if vitra_ann is not None:
+        vdf = vitra_ann.get('video_decode_frame')
+        if vdf is not None:
+            from rescale_to_metric import _rebase_vdf
+            rebased_vdf = _rebase_vdf(np.asarray(vdf), args.vitra_annotation)
+            vdf_set = set(int(v) for v in rebased_vdf)
+            before = len(depth_files)
+            depth_files = [
+                dp for dp in depth_files
+                if int(os.path.splitext(os.path.basename(dp))[0]) in vdf_set
+            ]
+            if len(depth_files) < before:
+                print(f"Excluded {before - len(depth_files)} margin frames "
+                      f"(keeping {len(depth_files)} annotated frames)")
 
     for depth_path in depth_files:
         basename = os.path.splitext(os.path.basename(depth_path))[0]
@@ -968,13 +892,25 @@ def main():
 
         if vitra_ann is not None and mano_data is not None:
             # VITRA-based hand reconstruction using MANO forward pass
-            # TTT3R frame i corresponds to VITRA temporal index i (both
-            # process the same clip sequentially).  video_decode_frame
-            # contains original video frame numbers, NOT clip-local indices.
-            vitra_idx = int(basename) * args.stride
-            n_vitra = len(vitra_ann.get('video_decode_frame', []))
-            if vitra_idx >= n_vitra:
-                vitra_idx = None
+            # video_decode_frame maps VITRA index → video frame number.
+            # TTT3R frame basename is the video frame number.  Look up
+            # which VITRA index corresponds to this video frame.
+            video_frame_num = int(basename) * args.stride
+            vitra_frame_indices = vitra_ann.get('video_decode_frame', None)
+            vitra_idx = None
+            if vitra_frame_indices is not None:
+                # Rebase absolute vdf to clip-relative for datasets like Epic-Kitchens
+                from rescale_to_metric import _rebase_vdf
+                rebased_vdf = _rebase_vdf(np.asarray(vitra_frame_indices), args.vitra_annotation)
+                matches = np.where(rebased_vdf == video_frame_num)[0]
+                if len(matches) > 0:
+                    vitra_idx = int(matches[0])
+            else:
+                # No video_decode_frame: assume 1:1 mapping
+                vitra_idx = video_frame_num
+                n_vitra = max(len(vitra_ann.get(h, {}).get('kept_frames', [])) for h in ['left', 'right'] if h in vitra_ann)
+                if vitra_idx >= n_vitra:
+                    vitra_idx = None
             if vitra_idx is None:
                 print(f"  Frame {basename} not in VITRA annotation")
 
@@ -1030,14 +966,14 @@ def main():
                     if args.contrast:
                         hand_colors = np.tile([255, 105, 180], (len(hand_pts_cam), 1))
 
-                    # Transform hand from VITRA metric space to TTT3R camera
-                    # space.  Wrist-anchored uniform scaling: anchor wrist at
-                    # the correct TTT3R 3D position (from depth map), then
-                    # uniformly scale the hand shape around it.  This preserves
-                    # the 3D shape (no anisotropic distortion) while placing
-                    # the hand at the correct depth and pixel location.
-                    if global_hand_scale is not None and vitra_intrinsics is not None:
-                        # Compute per-hand local scale from wrist depth
+                    # When TTT3R is metric-scaled, MANO hands are already in
+                    # the same coordinate system — no scaling needed.
+                    # Otherwise fall back to wrist-anchored scaling.
+                    if is_metric:
+                        hand_pts_cam_scaled = hand_pts_cam
+                        hand_verts_cam_scaled = hand_verts
+                    elif vitra_intrinsics is not None:
+                        # Legacy: wrist-anchored scaling for non-metric TTT3R
                         wrist_cam = vitra_hand['joints_camspace'][vitra_idx][0]
                         vW = int(round(2 * vitra_intrinsics[0, 2]))
                         vH = int(round(2 * vitra_intrinsics[1, 2]))
@@ -1054,9 +990,8 @@ def main():
                         if d_at_wrist > 0 and wrist_cam[2] > 0:
                             local_scale = float(d_at_wrist / wrist_cam[2])
                         else:
-                            local_scale = global_hand_scale
+                            local_scale = 1.0
 
-                        # Unproject wrist into TTT3R 3D space using TTT3R intrinsics
                         fxt, fyt = intrinsics[0, 0], intrinsics[1, 1]
                         cxt, cyt = intrinsics[0, 2], intrinsics[1, 2]
                         wrist_ttt3r = np.array([
@@ -1065,18 +1000,13 @@ def main():
                             d_at_wrist
                         ])
 
-                        # Uniform scale hand shape around wrist, then place at TTT3R wrist
                         hand_pts_cam_scaled = (hand_pts_cam - wrist_cam) * local_scale + wrist_ttt3r
                         hand_verts_cam_scaled = (hand_verts - wrist_cam) * local_scale + wrist_ttt3r
                         print(f"    local_scale={local_scale:.4f} (depth@wrist={d_at_wrist:.4f}, vitra_z={wrist_cam[2]:.4f})")
-                    elif global_hand_scale is not None:
-                        hand_pts_cam_scaled = hand_pts_cam * global_hand_scale
-                        hand_verts_cam_scaled = hand_verts * global_hand_scale
                     else:
                         hand_pts_cam_scaled = hand_pts_cam
                         hand_verts_cam_scaled = hand_verts
 
-                    # Save scaled mesh for rasterized hand mask
                     hand_meshes_cam.append((hand_verts_cam_scaled, hand_faces))
 
                     # Transform to world space
@@ -1585,16 +1515,6 @@ def main():
         combined_pcd = trimesh.PointCloud(pts, colors=cols)
         print(f"  Occlusion culling: {n_before} → {len(pts)} points "
               f"({n_before - len(pts)} removed, {100*(n_before-len(pts))/max(n_before,1):.1f}%)")
-
-        # Rescale to metric using global hand-derived scale factor.
-        # Computed once from the first valid VITRA frame, applied to ALL frames
-        # for consistent scale (TTT3R is globally scale-consistent).
-        if global_hand_scale is not None and global_hand_scale > 0:
-            cam_origin = pose_c2w[:3, 3]
-            pts = np.asarray(combined_pcd.vertices)
-            cols = np.asarray(combined_pcd.colors)
-            pts = (pts - cam_origin) / global_hand_scale + cam_origin
-            combined_pcd = trimesh.PointCloud(pts, colors=cols)
 
         # Save main PLY
         out_path = os.path.join(args.output_dir, f"{basename}.ply")

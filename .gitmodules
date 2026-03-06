@@ -4,3 +4,6 @@
 [submodule "TTT3R"]
 	path = TTT3R
 	url = https://github.com/Inception3D/TTT3R.git
+[submodule "Pi3"]
+	path = Pi3
+	url = git@github.com:lifchrs/Pi3.git

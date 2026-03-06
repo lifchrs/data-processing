@@ -1,0 +1,12 @@
+{
+    "ssv2_video_dir": "../VITRA/20bn-something-something-v2",
+    "epic_video_dir": "../vitra_data/epic_videos/EPIC-KITCHENS",
+    "recon_method": "ttt3r",
+
+    "episodes": [
+        {"annotation_path": "../vitra_data/ssv2/episodic_annotations/somethingsomethingv2_100000_ep_000000.npy"},
+        {"annotation_path": "../vitra_data/ssv2/episodic_annotations/somethingsomethingv2_100002_ep_000000.npy"},
+        {"annotation_path": "../vitra_data/epic_annotations/epic/episodic_annotations/epic_kitchens_P01_01_ep_000229.npy"},
+        {"annotation_path": "../vitra_data/epic_annotations/epic/episodic_annotations/epic_kitchens_P30_05_ep_001967.npy"}
+    ]
+}

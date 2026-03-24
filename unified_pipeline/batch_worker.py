@@ -9,7 +9,7 @@ Two modes:
   - TTT3R mode:  Loads TTT3R model once, processes all videos for Step 1.
                  Runs undistortion (Ego4D/EgoExo4D) before each video.
   - SAM3D mode:  Loads SAM3 + Inference models once, processes Steps 3-4 for all videos.
-                 Auto-derives frames_dir/camera_dir from ttt3r_output if not in manifest.
+                 Auto-derives frames_dir/camera_dir from intermediate_depth if not in manifest.
                  Runs quality flags check after Step 3.
 
 Usage (run from the appropriate conda env):
@@ -26,8 +26,8 @@ Manifest format: JSON list of dicts:
             "video_path": "/path/to/video.mp4",
             "output_dir": "/path/to/output",
             "annotation_path": "/path/to/annotation.npy",  // optional
-            "frames_dir": "/path/to/frames",                // optional, auto-derived from ttt3r_output
-            "camera_dir": "/path/to/cameras",               // optional, auto-derived from ttt3r_output
+            "frames_dir": "/path/to/frames",                // optional, auto-derived from intermediate_depth
+            "camera_dir": "/path/to/cameras",               // optional, auto-derived from intermediate_depth
             "prompt": "object held in hand"                  // optional
         },
         ...
@@ -85,7 +85,7 @@ def _rebase_vdf(vdf, annotation_path):
     return vdf
 
 
-def _rename_ttt3r_outputs(ttt3r_out, offset, n_frames):
+def _rename_intermediate_depths(ttt3r_out, offset, n_frames):
     """Rename sequential TTT3R output files to original video frame indices.
 
     prepare_output saves files as 000000, 000001, ... but when we clipped
@@ -174,7 +174,7 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
         annotation_path = entry.get("annotation_path")
-        ttt3r_out = os.path.join(output_dir, "ttt3r_output")
+        ttt3r_out = os.path.join(output_dir, "intermediate_depth")
         os.makedirs(ttt3r_out, exist_ok=True)
 
         # Skip if already processed
@@ -249,7 +249,7 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
 
             # Rename sequential outputs to original video frame indices
             if clip_offset > 0:
-                _rename_ttt3r_outputs(ttt3r_out, clip_offset, len(img_paths))
+                _rename_intermediate_depths(ttt3r_out, clip_offset, len(img_paths))
 
             elapsed = time.time() - t_start
             print(f"  Done in {elapsed:.1f}s")
@@ -270,7 +270,12 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
 
 def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                   intrinsics_root=None):
-    """Load Pi3 model once and process all videos."""
+    """Load Pi3 model once and process all videos.
+
+    For each video:
+      1. Pi3 reconstruction → depth, color, camera
+      2. Metric rescaling using VITRA hand annotations as ruler
+    """
     import torch
 
     pi3_dir = os.path.join(PROJECT_ROOT, "Pi3")
@@ -279,7 +284,7 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
     from pi3.utils.basic import load_images_as_tensor
     from pi3.models.pi3x import Pi3X
 
-    # Load model once
+    # Load Pi3 model
     print(f"Loading Pi3X model...")
     t0 = time.time()
     if pi3_ckpt is not None:
@@ -294,27 +299,23 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
         model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
         model.disable_multimodal()
     model = model.to(device)
-    print(f"Model loaded in {time.time() - t0:.1f}s")
+    print(f"Pi3 model loaded in {time.time() - t0:.1f}s")
 
     dtype = torch.bfloat16 if (device != "cpu" and
             torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+
+    # Top-level results dir (parent of per-video output_dirs)
+    results_dir = os.path.dirname(manifest[0]["output_dir"]) if manifest else "."
 
     results = []
     for i, entry in enumerate(manifest):
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
         annotation_path = entry.get("annotation_path")
-        pi3_out = os.path.join(output_dir, "ttt3r_output")
+        pi3_out = os.path.join(output_dir, "intermediate_depth")
         os.makedirs(pi3_out, exist_ok=True)
 
-        # Skip if already processed
-        depth_out = os.path.join(pi3_out, "depth")
-        if os.path.isdir(depth_out) and os.listdir(depth_out):
-            print(f"\n[{i+1}/{len(manifest)}] Skipping (already done): {video_path}")
-            results.append({"video": video_path, "success": True, "skipped": True})
-            continue
-
-        print(f"\n[{i+1}/{len(manifest)}] Processing: {video_path}")
+        print(f"\n[{i+1}/{len(manifest)}] Processing: {os.path.basename(output_dir)}")
         t_start = time.time()
 
         try:
@@ -322,12 +323,9 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
             import cv2
             import numpy as np
 
-            # Clean up partial output
+            # Clean up any previous output
             if os.path.isdir(pi3_out):
-                for sub in os.listdir(pi3_out):
-                    sub_path = os.path.join(pi3_out, sub)
-                    if os.path.isdir(sub_path):
-                        shutil.rmtree(sub_path)
+                shutil.rmtree(pi3_out)
 
             # Undistort if needed
             effective_video = _run_undistortion(
@@ -380,7 +378,7 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                     print(f"  Clipping to VITRA range: frames {clip_start}-{clip_end} "
                           f"({N}/{n_before} frames)")
 
-            # Run inference
+            # Run Pi3 inference
             with torch.no_grad():
                 with torch.amp.autocast('cuda', dtype=dtype):
                     res = model(imgs[None])
@@ -399,8 +397,6 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                 basename = f"{frame_num:06d}"
 
                 depth = local_points[fi, :, :, 2].copy()
-                c = 1.0 / (1.0 + np.exp(-conf[fi, :, :, 0]))
-                depth[c < 0.1] = 0
                 depth[depth < 0] = 0
                 np.save(os.path.join(depth_dir, f"{basename}.npy"),
                         depth.astype(np.float32))
@@ -416,8 +412,18 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                     cv2.imwrite(os.path.join(color_dir, f"{basename}.png"),
                                 cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
 
+            print(f"  Pi3 done in {time.time() - t_start:.1f}s ({N} frames)")
+
+            # --- Step 2: Metric rescaling ---
+            # Pi3's depth scale can be off by 2-7x. Use VITRA's MANO hand
+            # annotations as a metric ruler to rescale depth maps + camera
+            # translations to true metric.
+            if annotation_path and os.path.exists(annotation_path):
+                from rescale_to_metric import rescale_depth_maps_only
+                rescale_depth_maps_only(pi3_out, annotation_path)
+
             elapsed = time.time() - t_start
-            print(f"  Done in {elapsed:.1f}s ({N} frames)")
+            print(f"  Total: {elapsed:.1f}s")
             results.append({"video": video_path, "success": True,
                             "elapsed_s": round(elapsed, 1)})
 
@@ -481,15 +487,15 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
         annotation_path = entry.get("annotation_path")
-        ttt3r_out = os.path.join(output_dir, "ttt3r_output")
+        ttt3r_out = os.path.join(output_dir, "intermediate_depth")
         frames_dir = entry.get("frames_dir") or os.path.join(ttt3r_out, "color")
         camera_dir = entry.get("camera_dir") or os.path.join(ttt3r_out, "camera")
         prompt = entry.get("prompt", "object held in either hand")
 
         # Skip if final output already exists
-        ply_out = os.path.join(output_dir, "ply_output")
+        ply_out = os.path.join(output_dir, "depth")
         if os.path.isdir(ply_out) and any(
-            f.endswith(".ply") for f in os.listdir(ply_out)
+            f.endswith(".npy") for f in os.listdir(ply_out)
         ):
             print(f"\n[{i+1}/{len(manifest)}] Skipping (already done): {os.path.basename(output_dir)}")
             results.append({"video": video_path, "success": True, "skipped": True})
@@ -504,7 +510,8 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
             # --- Metric rescaling ---
             if annotation_path and os.path.exists(annotation_path):
                 from rescale_to_metric import rescale_ttt3r_to_metric
-                rescale_ttt3r_to_metric(ttt3r_out, annotation_path)
+                rescale_ttt3r_to_metric(ttt3r_out, annotation_path,
+                                        results_dir=output_dir)
 
             # --- Step 3: SAM3D Object Detection + Reconstruction ---
             if not skip_sam3d:
@@ -749,7 +756,7 @@ def _run_combine_single(ttt3r_out, sam3d_out, output_dir, frame_interval,
                         annotation_path, skip_visualizations):
     """Run the combine step as a subprocess (it's fast, not worth deep integration)."""
 
-    ply_out = os.path.join(output_dir, "ply_output")
+    ply_out = os.path.join(output_dir, "depth")
     os.makedirs(ply_out, exist_ok=True)
 
     cmd = [
@@ -774,6 +781,100 @@ def _run_combine_single(ttt3r_out, sam3d_out, output_dir, frame_interval,
 # CLI
 # ---------------------------------------------------------------------------
 
+def _prepare_for_training(manifest, manifest_path):
+    """Post-pipeline step: make outputs training-ready.
+
+    1. Create depth symlinks: <video_dir>/depth -> intermediate_depth/depth
+    2. Build filtered episode_frame_index.npz for these videos
+
+    Annotations are VITRA originals (already in episodic_annotations/).
+    Only depth maps need to be made accessible to training.
+    """
+    import numpy as np
+
+    results_dir = os.path.dirname(os.path.abspath(manifest_path))
+    vitra3d_root = os.path.join(PROJECT_ROOT, "VITRA3D", "data_root")
+
+    print(f"\n{'='*60}")
+    print("Preparing outputs for training...")
+    print(f"{'='*60}")
+
+    # 1. Depth symlinks
+    n_links = 0
+    for entry in manifest:
+        video_dir = entry["output_dir"]
+        link = os.path.join(video_dir, "depth")
+        target = os.path.join("intermediate_depth", "depth")
+        if not os.path.exists(link):
+            os.symlink(target, link)
+            n_links += 1
+    print(f"  Depth symlinks: {n_links} created")
+
+    # 2. Build filtered episode_frame_index
+    # Determine dataset and collect annotation basenames
+    ann_basenames = set()
+    dataset = None
+    for entry in manifest:
+        ann_path = entry.get("annotation_path")
+        if not ann_path:
+            continue
+        bn = os.path.splitext(os.path.basename(ann_path))[0]
+        ann_basenames.add(bn)
+        if dataset is None:
+            fname = os.path.basename(ann_path)
+            for prefix, ds in [
+                ("somethingsomethingv2_", "ssv2"),
+                ("epic_kitchens_", "epic"),
+                ("EgoExo4D_", "egoexo4d"),
+                ("Ego4D_", "ego4d"),
+                ("adhitya_collected_data_", "adhitya_collected_data"),
+                ("dustpan_collected_data_", "dustpan_collected_data"),
+            ]:
+                if fname.startswith(prefix):
+                    dataset = ds
+                    break
+            if dataset is None:
+                dataset = "ssv2"
+
+    if not ann_basenames:
+        print("  WARNING: No annotations in manifest, skipping index build")
+        return
+
+    full_index_path = os.path.join(vitra3d_root, "Annotation", dataset,
+                                   "episode_frame_index.npz")
+    if not os.path.exists(full_index_path):
+        print(f"  WARNING: {full_index_path} not found, skipping index build")
+        return
+
+    idx = np.load(full_index_path, allow_pickle=True)
+    all_eps = list(idx['index_to_episode_id'])
+    all_pairs = idx['index_frame_pair']
+
+    # Only include episodes that match ep_000000 for the videos we processed
+    # (secondary episodes like ep_000001 won't have depth coverage)
+    keep_idx = [i for i, eid in enumerate(all_eps) if eid in ann_basenames]
+    keep_set = set(keep_idx)
+
+    mask = np.array([int(p[0]) in keep_set for p in all_pairs])
+    old_to_new = {old: new for new, old in enumerate(keep_idx)}
+    new_pairs = np.array([[old_to_new[int(p[0])], p[1]]
+                          for p in all_pairs[mask]], dtype=np.uint32)
+    new_eps = np.array([all_eps[i] for i in keep_idx])
+
+    batch_name = os.path.basename(results_dir)
+    index_path = os.path.join(vitra3d_root, "Annotation", dataset,
+                              f"episode_frame_index_{batch_name}.npz")
+    np.savez(index_path, index_frame_pair=new_pairs,
+             index_to_episode_id=new_eps)
+    print(f"  Episode index: {len(new_eps)} episodes, {len(new_pairs)} frames")
+    print(f"  Saved: {index_path}")
+
+    print(f"\n  To train, set in your config:")
+    print(f'    "precomputed_depth_root": "{results_dir}"')
+    print(f'    "annotation_override": "Annotation/{dataset}/'
+          f'episode_frame_index_{batch_name}.npz"')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Persistent batch worker: load models once, process multiple videos",
@@ -792,7 +893,6 @@ def main():
     # Pi3 options
     parser.add_argument("--pi3_ckpt", type=str, default=None,
                         help="Pi3X checkpoint path (default: auto-download)")
-
     # Common options
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--frame_interval", type=int, default=1)
@@ -805,9 +905,24 @@ def main():
     parser.add_argument("--results_file", type=str, default=None,
                         help="Path to write results JSON (default: {manifest_dir}/batch_{mode}_results.json)")
 
+    # Multi-GPU
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="Number of GPUs to use. Splits manifest and launches "
+                             "one worker per GPU as subprocesses.")
+
     args = parser.parse_args()
 
-    # Load manifest
+    # Multi-GPU: split manifest and fork
+    if args.num_gpus > 1:
+        _run_multi_gpu(args)
+    else:
+        _run_single(args)
+
+
+def _run_single(args):
+    """Run a single worker on the current GPU."""
+    import subprocess as _sp
+
     with open(args.manifest) as f:
         manifest = json.load(f)
 
@@ -853,6 +968,120 @@ def main():
     with open(results_path, "w") as f:
         json.dump({"results": results, "total_s": round(total, 1), "n_ok": n_ok}, f, indent=2)
     print(f"Results saved to: {results_path}")
+
+    # Post-processing: prepare outputs for training
+    if args.mode == "pi3":
+        _prepare_for_training(manifest, args.manifest)
+
+
+def _run_multi_gpu(args):
+    """Split manifest across GPUs and launch one subprocess per GPU."""
+    import subprocess as _sp
+    import tempfile
+
+    with open(args.manifest) as f:
+        manifest = json.load(f)
+
+    num_gpus = args.num_gpus
+    manifest_dir = os.path.dirname(os.path.abspath(args.manifest))
+
+    print(f"Multi-GPU mode: {num_gpus} GPUs, {len(manifest)} videos")
+    print(f"  ~{len(manifest) // num_gpus} videos per GPU\n")
+
+    # Write per-GPU shard manifests
+    shard_files = []
+    for gpu_id in range(num_gpus):
+        shard = manifest[gpu_id::num_gpus]
+        if not shard:
+            continue
+        shard_path = os.path.join(manifest_dir,
+                                  f".shard_gpu{gpu_id}_{os.path.basename(args.manifest)}")
+        with open(shard_path, "w") as f:
+            json.dump(shard, f)
+        shard_files.append((gpu_id, shard_path, len(shard)))
+
+    # Build base command (pass through all args except --num_gpus and --manifest)
+    base_cmd = [sys.executable, os.path.abspath(__file__)]
+    base_cmd += ["--mode", args.mode, "--num_gpus", "1"]
+    if args.pi3_ckpt:
+        base_cmd += ["--pi3_ckpt", args.pi3_ckpt]
+    if args.frame_interval != 1:
+        base_cmd += ["--frame_interval", str(args.frame_interval)]
+    if args.intrinsics_root:
+        base_cmd += ["--intrinsics_root", args.intrinsics_root]
+    if args.skip_scene_seg:
+        base_cmd.append("--skip_scene_seg")
+    if args.skip_sam3d:
+        base_cmd.append("--skip_sam3d")
+    if args.skip_combine:
+        base_cmd.append("--skip_combine")
+    if args.skip_visualizations:
+        base_cmd.append("--skip_visualizations")
+    if args.mode == "ttt3r":
+        base_cmd += ["--model_path", args.model_path, "--img_size", str(args.img_size)]
+
+    # Launch subprocesses
+    procs = []
+    for gpu_id, shard_path, n_videos in shard_files:
+        results_file = os.path.join(
+            manifest_dir, f"batch_{args.mode}_gpu{gpu_id}_results.json")
+        cmd = base_cmd + [
+            "--manifest", shard_path,
+            "--device", "cuda",
+            "--results_file", results_file,
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+        log_path = os.path.join(manifest_dir, f"gpu{gpu_id}.log")
+        log_file = open(log_path, "w")
+
+        print(f"  GPU {gpu_id}: {n_videos} videos, log: {log_path}")
+        proc = _sp.Popen(cmd, env=env, stdout=log_file, stderr=_sp.STDOUT)
+        procs.append((gpu_id, proc, log_file, shard_path, results_file))
+
+    print(f"\nAll {len(procs)} workers launched. Waiting...\n")
+
+    # Wait for all
+    all_ok = True
+    for gpu_id, proc, log_file, shard_path, results_file in procs:
+        proc.wait()
+        log_file.close()
+        status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
+        print(f"  GPU {gpu_id}: {status}")
+        if proc.returncode != 0:
+            all_ok = False
+        # Clean up shard file
+        os.unlink(shard_path)
+
+    # Merge results
+    all_results = []
+    for gpu_id, _, _, _, results_file in procs:
+        if os.path.exists(results_file):
+            with open(results_file) as f:
+                data = json.load(f)
+            all_results.extend(data.get("results", []))
+
+    n_ok = sum(1 for r in all_results if r.get("success"))
+    print(f"\n{'='*60}")
+    print(f"Multi-GPU batch complete: {n_ok}/{len(all_results)} succeeded")
+    print(f"{'='*60}")
+
+    # Save merged results
+    if args.results_file:
+        merged_path = args.results_file
+    else:
+        merged_path = os.path.join(manifest_dir, f"batch_{args.mode}_results.json")
+    with open(merged_path, "w") as f:
+        json.dump({"results": all_results, "n_ok": n_ok,
+                    "num_gpus": num_gpus}, f, indent=2)
+    print(f"Merged results: {merged_path}")
+
+    # Post-processing: prepare outputs for training
+    if args.mode == "pi3":
+        with open(args.manifest) as f:
+            full_manifest = json.load(f)
+        _prepare_for_training(full_manifest, args.manifest)
 
 
 if __name__ == "__main__":

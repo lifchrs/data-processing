@@ -144,7 +144,7 @@ def run_ttt3r(video_path, output_dir, frame_interval, device, ttt3r_env,
     log.log("step1_reconstruction",
             "\n" + "=" * 80 + "\nSTEP 1/4: Running TTT3R Scene Reconstruction\n" + "=" * 80)
 
-    ttt3r_out = os.path.join(output_dir, "ttt3r_output")
+    ttt3r_out = os.path.join(output_dir, "intermediate_depth")
     os.makedirs(ttt3r_out, exist_ok=True)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -221,7 +221,7 @@ def run_pi3(video_path, output_dir, frame_interval, device, pi3_env,
     log.log("step1_reconstruction",
             "\n" + "=" * 80 + "\nSTEP 1/4: Running Pi3 Scene Reconstruction\n" + "=" * 80)
 
-    pi3_out = os.path.join(output_dir, "ttt3r_output")
+    pi3_out = os.path.join(output_dir, "intermediate_depth")
     os.makedirs(pi3_out, exist_ok=True)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -261,7 +261,7 @@ def run_megasam(video_path, output_dir, frame_interval, device, megasam_env,
     log.log("step1_reconstruction",
             "\n" + "=" * 80 + "\nSTEP 1/4: Running MegaSAM Scene Reconstruction\n" + "=" * 80)
 
-    megasam_out = os.path.join(output_dir, "ttt3r_output")
+    megasam_out = os.path.join(output_dir, "intermediate_depth")
     os.makedirs(megasam_out, exist_ok=True)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -424,7 +424,7 @@ def combine_outputs(ttt3r_out, sam3d_out, output_dir, frame_interval, sam3d_env,
     log.log("step4_combine",
             "\n" + "=" * 80 + "\nSTEP 4/4: Combining Outputs into Point Cloud\n" + "=" * 80)
 
-    ply_out = os.path.join(output_dir, "ply_output")
+    ply_out = os.path.join(output_dir, "depth")
     os.makedirs(ply_out, exist_ok=True)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -593,7 +593,7 @@ Examples:
                         choices=["ttt3r", "megasam", "pi3"],
                         help="Scene reconstruction method (default: ttt3r)")
     parser.add_argument("--skip_reconstruction", action="store_true",
-                        help="Skip step 1 (reuse existing ttt3r_output)")
+                        help="Skip step 1 (reuse existing intermediate_depth)")
     parser.add_argument("--skip_scene_seg", action="store_true",
                         help="Skip step 2 (scene segmentation)")
     parser.add_argument("--skip_sam3d", action="store_true",
@@ -848,7 +848,7 @@ def main():
     else:
         # Sequential execution
         if args.skip_reconstruction:
-            ttt3r_out = os.path.join(args.output_dir, "ttt3r_output")
+            ttt3r_out = os.path.join(args.output_dir, "intermediate_depth")
             log.log("step1_reconstruction",
                     f"Skipping reconstruction (using existing output: {ttt3r_out})",
                     skipped=True, output_dir=ttt3r_out)

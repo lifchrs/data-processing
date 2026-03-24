@@ -6,8 +6,8 @@ Embeds all point cloud data and images directly into a single HTML file
 that can be opened locally in any browser — no server needed.
 
 Expected directory layout per video:
-    <results_dir>/<video_id>/ply_output/   — PLY point clouds (required)
-    <results_dir>/<video_id>/ttt3r_output/ — color frames + camera poses
+    <results_dir>/<video_id>/depth/   — .npy depth maps (required)
+    <results_dir>/<video_id>/intermediate_depth/ — color frames + camera poses
 
 Usage:
     python export_viewer.py --results_dir batch_ssv2_output --output viewer_export.html
@@ -15,11 +15,13 @@ Usage:
 
 import argparse
 import base64
+import io
 import json
 import os
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 
@@ -39,17 +41,17 @@ def scan_results(results_dir):
         if not os.path.isdir(video_dir):
             continue
 
-        ply_dir = os.path.join(video_dir, "ply_output")
-        color_dir = os.path.join(video_dir, "ttt3r_output", "color")
-        camera_dir = os.path.join(video_dir, "ttt3r_output", "camera")
+        ply_dir = os.path.join(video_dir, "depth")
+        color_dir = os.path.join(video_dir, "intermediate_depth", "color")
+        camera_dir = os.path.join(video_dir, "intermediate_depth", "camera")
 
         if not os.path.isdir(ply_dir) or not os.path.isdir(color_dir):
             continue
 
-        ply_files = sorted([f for f in os.listdir(ply_dir) if f.endswith(".ply") and "_" not in f])
+        depth_npy_files = sorted([f for f in os.listdir(ply_dir) if f.endswith(".npy")])
         color_files = sorted([f for f in os.listdir(color_dir) if f.endswith((".png", ".jpg"))])
 
-        if not ply_files:
+        if not depth_npy_files:
             continue
 
         action_text = entry
@@ -58,7 +60,7 @@ def scan_results(results_dir):
                 action_text = item.get("action_text", entry)
                 break
 
-        ply_basenames = [os.path.splitext(f)[0] for f in ply_files]
+        depth_basenames = [os.path.splitext(f)[0] for f in depth_npy_files]
 
         # Scan SAM3D output for frames with object reconstructions
         sam3d_dir = os.path.join(video_dir, "sam3d_output")
@@ -72,7 +74,7 @@ def scan_results(results_dir):
                     recon_frame_indices.add(idx)
 
         frames = []
-        for i, bn in enumerate(ply_basenames):
+        for i, bn in enumerate(depth_basenames):
             color_file = None
             for cf in color_files:
                 if os.path.splitext(cf)[0] == bn:
@@ -81,15 +83,19 @@ def scan_results(results_dir):
             # Load camera pose (c2w 4x4 matrix) if available
             camera_path = os.path.join(camera_dir, bn + ".npz")
             pose = None
+            intrinsics = None
             if os.path.exists(camera_path):
                 cam_data = np.load(camera_path)
                 if "pose" in cam_data:
                     pose = cam_data["pose"].astype(float).tolist()  # 4x4 list
+                if "intrinsics" in cam_data:
+                    intrinsics = cam_data["intrinsics"]
             frames.append({
                 "basename": bn,
-                "ply_path": os.path.join(ply_dir, ply_files[i]),
+                "npy_path": os.path.join(ply_dir, depth_npy_files[i]),
                 "color_path": os.path.join(color_dir, color_file) if color_file else None,
                 "pose_c2w": pose,
+                "intrinsics": intrinsics,
                 "has_reconstruction": int(bn) in recon_frame_indices,
             })
 
@@ -106,6 +112,77 @@ def encode_file_b64(path):
     """Read file and return base64 string."""
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("ascii")
+
+
+def generate_ply_bytes(npy_path, intrinsics, pose_c2w, color_path=None):
+    """Generate binary PLY bytes from .npy depth + camera + color."""
+    depth = np.load(npy_path)
+    pose_c2w = np.array(pose_c2w)
+    H, W = depth.shape
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    color = None
+    if color_path and os.path.isfile(color_path):
+        color = cv2.imread(color_path)
+        if color is not None:
+            color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+            if color.shape[:2] != depth.shape[:2]:
+                color = cv2.resize(color, (W, H))
+
+    y_grid, x_grid = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+    valid = depth > 0
+
+    valid_count = valid.sum()
+    stride = max(1, int(np.sqrt(valid_count / 200000)))
+    if stride > 1:
+        subsample = np.zeros_like(valid)
+        subsample[::stride, ::stride] = True
+        valid = valid & subsample
+
+    z = depth[valid]
+    x = x_grid[valid]
+    y = y_grid[valid]
+
+    X = (x - cx) * z / fx
+    Y = (y - cy) * z / fy
+    pts_cam = np.stack([X, Y, z], axis=-1)
+    R = pose_c2w[:3, :3]
+    t = pose_c2w[:3, 3]
+    pts_world = (R @ pts_cam.T).T + t
+
+    if color is not None:
+        colors = color[valid]
+    else:
+        colors = np.full((len(pts_world), 3), 180, dtype=np.uint8)
+
+    n = len(pts_world)
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    buf = io.BytesIO()
+    buf.write(header.encode("ascii"))
+    vertex_data = np.empty(n, dtype=[
+        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+        ('r', 'u1'), ('g', 'u1'), ('b', 'u1'),
+    ])
+    vertex_data['x'] = pts_world[:, 0].astype(np.float32)
+    vertex_data['y'] = pts_world[:, 1].astype(np.float32)
+    vertex_data['z'] = pts_world[:, 2].astype(np.float32)
+    vertex_data['r'] = colors[:, 0].astype(np.uint8)
+    vertex_data['g'] = colors[:, 1].astype(np.uint8)
+    vertex_data['b'] = colors[:, 2].astype(np.uint8)
+    buf.write(vertex_data.tobytes())
+    return buf.getvalue()
 
 
 def main():
@@ -148,8 +225,11 @@ def main():
         for frame in info["frames"]:
             fd = {"basename": frame["basename"]}
 
-            # Encode PLY
-            ply_b64 = encode_file_b64(frame["ply_path"])
+            # Generate PLY from .npy and encode
+            ply_bytes = generate_ply_bytes(
+                frame["npy_path"], frame["intrinsics"],
+                frame["pose_c2w"], frame["color_path"])
+            ply_b64 = base64.b64encode(ply_bytes).decode("ascii")
             fd["ply_b64"] = ply_b64
             total_size += len(ply_b64)
 

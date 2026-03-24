@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>4D Reconstruction Viewer</title>
+<title>Hand Correction Comparison</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #1a1a2e; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif; overflow: hidden; height: 100vh; }
@@ -25,21 +25,21 @@
 
   #main { display: flex; height: calc(100vh - 48px - 56px); }
 
-  #left-panel { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #0f3460; position: relative; background: #111; }
-  #left-panel .panel-label {
+  .panel { flex: 1; position: relative; background: #0a0a1a; }
+  .panel + .panel { border-left: 2px solid #0f3460; }
+  .panel-label {
     position: absolute; top: 8px; left: 8px; z-index: 10;
-    background: rgba(15,52,96,0.85); padding: 3px 10px; border-radius: 4px; font-size: 12px;
+    padding: 4px 12px; border-radius: 4px; font-size: 13px; font-weight: 600;
+    pointer-events: none;
   }
-  #frame-image {
-    width: 100%; height: 100%; object-fit: contain; display: block; background: #000;
-  }
+  #left-panel .panel-label { background: rgba(50,50,255,0.85); color: #fff; }
+  #right-panel .panel-label { background: rgba(0,200,0,0.85); color: #fff; }
+  .panel canvas { width: 100%; height: 100%; display: block; }
 
-  #right-panel { flex: 1; position: relative; background: #0a0a1a; }
-  #right-panel .panel-label {
-    position: absolute; top: 8px; left: 8px; z-index: 10;
-    background: rgba(15,52,96,0.85); padding: 3px 10px; border-radius: 4px; font-size: 12px;
+  .help-hint {
+    position: absolute; bottom: 8px; right: 8px; z-index: 10;
+    background: rgba(15,52,96,0.7); padding: 4px 8px; border-radius: 4px; font-size: 11px; color: #888;
   }
-  #three-canvas { width: 100%; height: 100%; display: block; }
 
   #controls {
     display: flex; align-items: center; gap: 12px; padding: 8px 16px;
@@ -60,48 +60,26 @@
   #follow-cam-group { display: flex; align-items: center; gap: 4px; }
   #follow-cam-group label { font-size: 12px; color: #a0a0c0; cursor: pointer; user-select: none; }
   #follow-cam-cb { cursor: pointer; }
-  #jump-recon-btn {
-    padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 600;
-    border: 1px solid #533483; cursor: pointer; white-space: nowrap;
-  }
-  #jump-recon-btn.has-recon { background: #2ecc71; color: #fff; border-color: #27ae60; }
-  #jump-recon-btn.has-recon:hover { background: #27ae60; }
-  #jump-recon-btn.no-recon { background: #333; color: #888; border-color: #444; cursor: default; }
-
-  .indicator-label {
-    display: none; position: absolute; right: 8px; z-index: 100;
-    padding: 5px 12px; border-radius: 4px; font-size: 12px; font-weight: 600;
-    pointer-events: none; color: #fff;
-  }
-  #hand-label { top: 8px; background: rgba(52, 152, 219, 0.95); }
-  #recon-label { top: 36px; background: rgba(46, 204, 113, 0.95); }
-
-  .help-hint {
-    position: absolute; bottom: 8px; right: 8px; z-index: 10;
-    background: rgba(15,52,96,0.7); padding: 4px 8px; border-radius: 4px; font-size: 11px; color: #888;
-  }
 </style>
 </head>
 <body>
 
 <div id="header">
-  <h1>4D Viewer</h1>
+  <h1>Hand Comparison</h1>
   <select id="video-select"></select>
   <span id="action-label"></span>
   <span id="loading-indicator">Loading...</span>
 </div>
 
 <div id="main">
-  <div id="left-panel">
-    <div class="panel-label">Original Frame</div>
-    <img id="frame-image" src="" alt="Video frame">
+  <div id="left-panel" class="panel">
+    <div class="panel-label">Original VITRA (blue)</div>
+    <canvas id="canvas-left"></canvas>
   </div>
-  <div id="right-panel">
-    <div class="panel-label">3D Reconstruction</div>
-    <canvas id="three-canvas"></canvas>
-    <div id="hand-label" class="indicator-label">Hand model</div>
-    <div id="recon-label" class="indicator-label">Object reconstruction</div>
-    <div class="help-hint">Drag: rotate | Scroll: zoom | Right-drag: pan | C: toggle camera follow</div>
+  <div id="right-panel" class="panel">
+    <div class="panel-label">Corrected (green)</div>
+    <canvas id="canvas-right"></canvas>
+    <div class="help-hint">Drag: rotate | Scroll: zoom | Right-drag: pan</div>
   </div>
 </div>
 
@@ -117,7 +95,6 @@
     <input type="checkbox" id="follow-cam-cb" checked>
     <label for="follow-cam-cb">Follow camera</label>
   </div>
-  <button id="jump-recon-btn" title="Jump to frame with object reconstruction">No object recon</button>
 </div>
 
 <script type="importmap">
@@ -140,92 +117,100 @@ let currentVideo = null;
 let currentFrameIdx = 0;
 let playing = false;
 let playInterval = null;
-let pointCloud = null;
 let pointSize = 2;
 let followCamera = true;
 let sceneRadius = 1;
-const plyCache = new Map();  // "videoId/frame" -> BufferGeometry
+let syncing = false;  // prevent infinite sync loop
 
-// ── Three.js setup ──
-const canvas = document.getElementById('three-canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setClearColor(0x0a0a1a);
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
-camera.position.set(0, 0, 3);
-
-const controls = new TrackballControls(camera, canvas);
-controls.rotateSpeed = 3.0;
-controls.zoomSpeed = 1.5;
-controls.panSpeed = 1.0;
-controls.dynamicDampingFactor = 0.15;
-controls.staticMoving = false;
-
+const plyCache = new Map();
 const plyLoader = new PLYLoader();
 
-function resizeRenderer() {
-  const panel = document.getElementById('right-panel');
-  const w = panel.clientWidth;
-  const h = panel.clientHeight;
-  renderer.setSize(w, h);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
+// ── Two renderers ──
+function createPanel(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setClearColor(0x0a0a1a);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
+  camera.position.set(0, 0, 3);
+
+  const controls = new TrackballControls(camera, canvas);
+  controls.rotateSpeed = 3.0;
+  controls.zoomSpeed = 1.5;
+  controls.panSpeed = 1.0;
+  controls.dynamicDampingFactor = 0.15;
+  controls.staticMoving = false;
+
+  return { canvas, renderer, scene, camera, controls, pointCloud: null };
 }
-window.addEventListener('resize', resizeRenderer);
+
+const panelL = createPanel('canvas-left');
+const panelR = createPanel('canvas-right');
+
+function resizeAll() {
+  for (const p of [panelL, panelR]) {
+    const container = p.canvas.parentElement;
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    p.renderer.setSize(w, h);
+    p.camera.aspect = w / h;
+    p.camera.updateProjectionMatrix();
+  }
+}
+window.addEventListener('resize', resizeAll);
+
+// ── Sync cameras ──
+function syncFrom(src, dst) {
+  if (syncing) return;
+  syncing = true;
+  dst.camera.position.copy(src.camera.position);
+  dst.camera.up.copy(src.camera.up);
+  dst.camera.quaternion.copy(src.camera.quaternion);
+  dst.controls.target.copy(src.controls.target);
+  dst.controls.update();
+  syncing = false;
+}
+
+// Listen for control changes on both panels
+panelL.controls.addEventListener('change', () => syncFrom(panelL, panelR));
+panelR.controls.addEventListener('change', () => syncFrom(panelR, panelL));
 
 function animate() {
   requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
+  panelL.controls.update();
+  panelR.controls.update();
+  panelL.renderer.render(panelL.scene, panelL.camera);
+  panelR.renderer.render(panelR.scene, panelR.camera);
 }
 animate();
 
-// ── Camera pose helpers ──
-// TTT3R outputs camera-to-world (c2w) poses in OpenCV convention:
-//   X=right, Y=down, Z=forward
-// Three.js camera convention:
-//   X=right, Y=up, Z=backward
+// ── Camera pose ──
 function applyCameraPose(pose_c2w) {
   if (!pose_c2w) return;
-  // pose_c2w is a 4x4 row-major array [[r00,r01,r02,tx], ...]
-  const px = pose_c2w[0][3];
-  const py = pose_c2w[1][3];
-  const pz = pose_c2w[2][3];
-
-  // Forward = 3rd column of rotation (camera Z = into scene in OpenCV)
-  const fwdX = pose_c2w[0][2];
-  const fwdY = pose_c2w[1][2];
-  const fwdZ = pose_c2w[2][2];
-
-  // Up = negated 2nd column (OpenCV Y is down, Three.js Y is up)
-  const upX = -pose_c2w[0][1];
-  const upY = -pose_c2w[1][1];
-  const upZ = -pose_c2w[2][1];
-
-  camera.position.set(px, py, pz);
-  camera.up.set(upX, upY, upZ);
-
-  // Look target = position + forward * distance
+  const px = pose_c2w[0][3], py = pose_c2w[1][3], pz = pose_c2w[2][3];
+  const fwdX = pose_c2w[0][2], fwdY = pose_c2w[1][2], fwdZ = pose_c2w[2][2];
+  const upX = -pose_c2w[0][1], upY = -pose_c2w[1][1], upZ = -pose_c2w[2][1];
   const d = sceneRadius * 0.5;
-  controls.target.set(px + fwdX * d, py + fwdY * d, pz + fwdZ * d);
-  controls.update();
+
+  for (const p of [panelL, panelR]) {
+    p.camera.position.set(px, py, pz);
+    p.camera.up.set(upX, upY, upZ);
+    p.controls.target.set(px + fwdX * d, py + fwdY * d, pz + fwdZ * d);
+    p.controls.update();
+  }
 }
 
-// ── UI elements ──
+// ── UI ──
 const videoSelect = document.getElementById('video-select');
 const actionLabel = document.getElementById('action-label');
-const frameImage = document.getElementById('frame-image');
 const timeSlider = document.getElementById('time-slider');
 const frameLabel = document.getElementById('frame-label');
 const playBtn = document.getElementById('play-btn');
 const pointSizeSlider = document.getElementById('point-size-slider');
 const loadingIndicator = document.getElementById('loading-indicator');
 const followCamCb = document.getElementById('follow-cam-cb');
-const handLabel = document.getElementById('hand-label');
-const reconLabel = document.getElementById('recon-label');
-const jumpReconBtn = document.getElementById('jump-recon-btn');
 
 followCamCb.addEventListener('change', () => {
   followCamera = followCamCb.checked;
@@ -256,7 +241,7 @@ async function init() {
 
   videoSelect.addEventListener('change', () => selectVideo(videoSelect.value));
   selectVideo(videoIds[0]);
-  resizeRenderer();
+  resizeAll();
 }
 
 function selectVideo(videoId) {
@@ -268,19 +253,6 @@ function selectVideo(videoId) {
   actionLabel.textContent = currentVideo.action_text;
   timeSlider.max = currentVideo.num_frames - 1;
   timeSlider.value = 0;
-
-  // Update jump-to-reconstruction button
-  const reconIdx = currentVideo.frames.findIndex(f => f.has_reconstruction);
-  if (reconIdx >= 0) {
-    jumpReconBtn.textContent = `Jump to recon (frame ${reconIdx})`;
-    jumpReconBtn.className = 'has-recon';
-    jumpReconBtn.onclick = () => { stopPlayback(); loadFrame(reconIdx); };
-  } else {
-    jumpReconBtn.textContent = 'No object recon found';
-    jumpReconBtn.className = 'no-recon';
-    jumpReconBtn.onclick = null;
-  }
-
   loadFrame(0);
 }
 
@@ -293,47 +265,35 @@ async function loadFrame(idx) {
   const frame = currentVideo.frames[idx];
   const videoId = currentVideo.video_id;
 
-  // Load image
-  if (frame.color) {
-    frameImage.src = `/data/${videoId}/intermediate_depth/color/${frame.color}`;
+  loadingIndicator.style.display = 'inline';
+
+  // Load both PLYs in parallel
+  const [geomL, geomR] = await Promise.all([
+    loadPLYCached(`${videoId}/${frame.basename}_original`, `/data/${videoId}/${frame.basename}_original.ply`),
+    loadPLYCached(`${videoId}/${frame.basename}_corrected`, `/data/${videoId}/${frame.basename}_corrected.ply`),
+  ]);
+
+  // Only show if still on same frame
+  if (currentFrameIdx === idx) {
+    showPointCloud(panelL, geomL, frame);
+    showPointCloud(panelR, geomR, frame);
   }
 
-  // Show/hide indicator labels
-  handLabel.style.display = frame.has_hand ? 'block' : 'none';
-  reconLabel.style.display = frame.has_reconstruction ? 'block' : 'none';
-  // Adjust recon label position based on whether hand label is visible
-  reconLabel.style.top = frame.has_hand ? '36px' : '8px';
-
-  // Load PLY
-  const cacheKey = `${videoId}/${frame.ply}`;
-  if (plyCache.has(cacheKey)) {
-    showPointCloud(plyCache.get(cacheKey), frame);
-  } else {
-    loadingIndicator.style.display = 'inline';
-    try {
-      const geometry = await loadPLY(`/data/${videoId}/depth/${frame.ply}`);
-      plyCache.set(cacheKey, geometry);
-      // Only show if we're still on the same frame
-      if (currentFrameIdx === idx) {
-        showPointCloud(geometry, frame);
-      }
-    } catch (e) {
-      console.error('Failed to load PLY:', e);
-    }
-    loadingIndicator.style.display = 'none';
-  }
+  loadingIndicator.style.display = 'none';
 }
 
-function loadPLY(url) {
-  return new Promise((resolve, reject) => {
+async function loadPLYCached(cacheKey, url) {
+  if (plyCache.has(cacheKey)) return plyCache.get(cacheKey);
+  const geometry = await new Promise((resolve, reject) => {
     plyLoader.load(url, resolve, undefined, reject);
   });
+  plyCache.set(cacheKey, geometry);
+  return geometry;
 }
 
-function showPointCloud(geometry, frame) {
-  if (pointCloud) {
-    scene.remove(pointCloud);
-    // Don't dispose — geometry is cached
+function showPointCloud(panel, geometry, frame) {
+  if (panel.pointCloud) {
+    panel.scene.remove(panel.pointCloud);
   }
 
   const material = new THREE.PointsMaterial({
@@ -342,71 +302,58 @@ function showPointCloud(geometry, frame) {
     sizeAttenuation: true,
   });
 
-  pointCloud = new THREE.Points(geometry, material);
-  scene.add(pointCloud);
+  panel.pointCloud = new THREE.Points(geometry, material);
+  panel.scene.add(panel.pointCloud);
 
-  // Compute scene scale on first frame of each video
   if (!currentVideo._sceneComputed) {
     geometry.computeBoundingSphere();
     sceneRadius = geometry.boundingSphere.radius;
     currentVideo._sceneComputed = true;
   }
 
-  // Apply camera pose from estimated viewpoint
   if (followCamera && frame && frame.pose_c2w) {
     applyCameraPose(frame.pose_c2w);
   } else if (!currentVideo._fallbackCentered) {
-    // Fallback: center on bounding sphere if no pose data
     geometry.computeBoundingSphere();
     const center = geometry.boundingSphere.center;
     const radius = geometry.boundingSphere.radius;
-    controls.target.copy(center);
-    camera.position.set(center.x, center.y, center.z + radius * 2.5);
-    controls.update();
+    for (const p of [panelL, panelR]) {
+      p.controls.target.copy(center);
+      p.camera.position.set(center.x, center.y, center.z + radius * 2.5);
+      p.controls.update();
+    }
     currentVideo._fallbackCentered = true;
   }
 }
 
-// ── Controls ──
-timeSlider.addEventListener('input', () => {
-  loadFrame(parseInt(timeSlider.value));
-});
-
-playBtn.addEventListener('click', () => {
-  if (playing) {
-    stopPlayback();
-  } else {
-    startPlayback();
-  }
-});
+// ── Playback ──
+timeSlider.addEventListener('input', () => loadFrame(parseInt(timeSlider.value)));
+playBtn.addEventListener('click', () => { if (playing) stopPlayback(); else startPlayback(); });
 
 function startPlayback() {
   playing = true;
-  playBtn.innerHTML = '&#9646;&#9646;';  // pause icon
+  playBtn.innerHTML = '&#9646;&#9646;';
   playInterval = setInterval(() => {
     let next = currentFrameIdx + 1;
     if (next >= currentVideo.num_frames) next = 0;
     loadFrame(next);
-  }, 200);  // ~5 fps playback
+  }, 200);
 }
 
 function stopPlayback() {
   playing = false;
-  playBtn.innerHTML = '&#9654;';  // play icon
-  if (playInterval) {
-    clearInterval(playInterval);
-    playInterval = null;
-  }
+  playBtn.innerHTML = '&#9654;';
+  if (playInterval) { clearInterval(playInterval); playInterval = null; }
 }
 
 pointSizeSlider.addEventListener('input', () => {
   pointSize = parseFloat(pointSizeSlider.value);
-  if (pointCloud) {
-    pointCloud.material.size = pointSize * 0.01;
+  for (const p of [panelL, panelR]) {
+    if (p.pointCloud) p.pointCloud.material.size = pointSize * 0.01;
   }
 });
 
-// Keyboard shortcuts
+// ── Keyboard shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
 
@@ -420,11 +367,9 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (playing) stopPlayback(); else startPlayback();
   } else if (e.key === 'Home') {
-    stopPlayback();
-    loadFrame(0);
+    stopPlayback(); loadFrame(0);
   } else if (e.key === 'End') {
-    stopPlayback();
-    loadFrame(currentVideo.num_frames - 1);
+    stopPlayback(); loadFrame(currentVideo.num_frames - 1);
   } else if (e.key === 'c') {
     followCamCb.checked = !followCamCb.checked;
     followCamera = followCamCb.checked;

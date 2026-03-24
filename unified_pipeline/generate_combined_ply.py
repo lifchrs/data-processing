@@ -85,245 +85,6 @@ def export_glb_as_obj(glb_path, obj_path, transform=None):
     print(f"Saved OBJ mesh: {obj_path}")
 
 
-# ── MANO hand model ──────────────────────────────────────────────────────────
-
-MANO_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                '..', 'mano_data', 'MANO_RIGHT_clean.npz')
-
-MANO_LEFT_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     '..', 'mano_data', 'MANO_LEFT_clean.npz')
-
-
-def load_mano_model(path=None):
-    """Load the clean MANO model (no chumpy dependency)."""
-    path = path or MANO_MODEL_PATH
-    data = dict(np.load(path, allow_pickle=True))
-    return data
-
-
-def mano_forward(mano_data, beta, global_orient, hand_pose, transl, is_left=False):
-    """
-    MANO forward pass: shape + pose blend shapes + LBS.
-
-    Args:
-        mano_data: dict from MANO_RIGHT_clean.npz
-        beta: (10,) shape parameters
-        global_orient: (3, 3) wrist rotation matrix
-        hand_pose: (15, 3, 3) finger joint rotation matrices
-        transl: (3,) translation
-        is_left: if True, mirror for left hand
-
-    Returns:
-        vertices: (778, 3) in camera space
-        faces: (1538, 3) face indices
-    """
-    v_template = mano_data['v_template'].copy()  # (778, 3)
-    shapedirs = mano_data['shapedirs'].copy()     # (778, 3, 10)
-    posedirs = mano_data['posedirs'].copy()       # (778, 3, 135)
-    J_regressor = mano_data['J_regressor']         # (16, 778)
-    weights = mano_data['weights']                 # (778, 16)
-    kintree = mano_data['kintree_table']           # (2, 16)
-    faces = mano_data['f'].copy()                  # (1538, 3)
-
-    if is_left:
-        # Mirror x for left hand
-        v_template[:, 0] *= -1
-        shapedirs[:, 0, :] *= -1
-        posedirs[:, 0, :] *= -1
-        faces = faces[:, ::-1]  # reverse winding
-        # Mirror rotations: S @ R @ S where S = diag(-1, 1, 1)
-        S = np.diag([-1.0, 1.0, 1.0])
-        global_orient = S @ global_orient @ S
-        hand_pose = np.array([S @ r @ S for r in hand_pose])
-        transl = transl.copy()
-        transl[0] *= -1
-
-    # 1. Shape blend shapes
-    v_shaped = v_template + np.einsum('ijk,k->ij', shapedirs, beta)
-
-    # 2. Rest-pose joints
-    J = J_regressor @ v_shaped  # (16, 3)
-
-    # 3. Full pose rotations: [global_orient, 15 finger joints]
-    pose_rotmats = np.concatenate([global_orient[None], hand_pose], axis=0)  # (16, 3, 3)
-
-    # 4. Pose blend shapes (exclude root joint)
-    ident = np.tile(np.eye(3), (15, 1, 1))
-    pose_feature = (pose_rotmats[1:] - ident).reshape(-1)  # (135,)
-    v_posed = v_shaped + np.einsum('ijk,k->ij', posedirs, pose_feature)
-
-    # 5. Linear Blend Skinning
-    parents = kintree[0].astype(np.int64)
-
-    local_T = np.zeros((16, 4, 4))
-    for i in range(16):
-        local_T[i, :3, :3] = pose_rotmats[i]
-        local_T[i, :3, 3] = J[0] if i == 0 else J[i] - J[parents[i]]
-        local_T[i, 3, 3] = 1.0
-
-    global_T = np.zeros((16, 4, 4))
-    global_T[0] = local_T[0]
-    for i in range(1, 16):
-        global_T[i] = global_T[parents[i]] @ local_T[i]
-
-    # Remove rest-pose offset for proper skinning
-    for i in range(16):
-        pad_J = np.array([J[i, 0], J[i, 1], J[i, 2], 0.0])
-        global_T[i, :, 3] -= global_T[i] @ pad_J
-
-    # Blend transforms per vertex
-    T = np.einsum('vj,jab->vab', weights, global_T)  # (778, 4, 4)
-    v_homo = np.ones((778, 4))
-    v_homo[:, :3] = v_posed
-    v_out = np.einsum('vab,vb->va', T, v_homo)[:, :3]
-
-    # Apply translation
-    v_out += transl
-
-    if is_left:
-        v_out[:, 0] *= -1
-
-    return v_out, faces
-
-
-def _procrustes_align(src, tgt):
-    """Rigid Procrustes: find R, t minimizing ||tgt - (R @ src.T).T - t||."""
-    mu_s = src.mean(axis=0)
-    mu_t = tgt.mean(axis=0)
-    H = (src - mu_s).T @ (tgt - mu_t)
-    U, S, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    R = Vt.T @ np.diag([1, 1, d]) @ U.T
-    t = mu_t - R @ mu_s
-    return R, t
-
-
-def generate_hand_mesh(mano_data, vitra_hand, frame_idx, is_left=False,
-                       mano_left_data=None):
-    """
-    Generate hand mesh vertices and faces for a specific frame.
-
-    For VITRA data, all MANO params (including left hands) are stored in
-    MANO_RIGHT convention.  However, left-hand joints_camspace was computed
-    using MANO_LEFT with S@R@S correction on hand_pose.  We replicate that:
-      - Left hands: use MANO_LEFT model + S@R@S on hand_pose
-      - Right hands: use MANO_RIGHT model as-is
-    Translation is computed by aligning the wrist joint to the stored
-    joints_camspace[0] position (since transl_camspace is deprecated).
-
-    Falls back to Procrustes alignment when MANO_LEFT model is unavailable.
-
-    Args:
-        mano_data: loaded MANO_RIGHT model dict
-        vitra_hand: dict with VITRA hand params (beta, global_orient_camspace, etc.)
-        frame_idx: index into the VITRA temporal dimension
-        is_left: whether this is the left hand
-        mano_left_data: loaded MANO_LEFT model dict (optional, enables correct
-                        left-hand reconstruction without Procrustes)
-
-    Returns:
-        vertices: (778, 3) in camera space, or None if frame not valid
-        faces: (1538, 3) face indices
-    """
-    kept = vitra_hand['kept_frames']
-    if not kept[frame_idx]:
-        return None, None
-
-    beta = vitra_hand['beta']  # (10,)
-    global_orient = vitra_hand['global_orient_camspace'][frame_idx]  # (3, 3)
-    hand_pose = vitra_hand['hand_pose'][frame_idx]  # (15, 3, 3)
-
-    if is_left and mano_left_data is not None:
-        # VITRA left-hand convention: HaWoR corrected global_orient (Y,Z negate
-        # in axis-angle) but did NOT correct hand_pose.  VITRA computed joints
-        # using MANO_LEFT + S@R@S on hand_pose.  Replicate that here.
-        S = np.diag([-1.0, 1.0, 1.0])
-        hand_pose_corrected = np.array([S @ r @ S for r in hand_pose])
-
-        # Compute wrist-aligned translation
-        verts_zero, faces = mano_forward(
-            mano_left_data, beta, global_orient, hand_pose_corrected,
-            np.zeros(3), is_left=False
-        )
-        J_reg = mano_left_data['J_regressor']
-        wrist_offset = J_reg[0] @ verts_zero  # wrist position with zero translation
-
-        if 'joints_camspace' in vitra_hand:
-            target_wrist = vitra_hand['joints_camspace'][frame_idx][0]
-        else:
-            target_wrist = wrist_offset  # no correction available
-
-        transl = target_wrist - wrist_offset
-        verts, faces = mano_forward(
-            mano_left_data, beta, global_orient, hand_pose_corrected,
-            transl, is_left=False
-        )
-    else:
-        # Right hand (or left without MANO_LEFT model): use MANO_RIGHT directly
-        # Compute wrist-aligned translation
-        verts_zero, faces = mano_forward(
-            mano_data, beta, global_orient, hand_pose,
-            np.zeros(3), is_left=False
-        )
-        J_reg = mano_data['J_regressor']
-        wrist_offset = J_reg[0] @ verts_zero
-
-        if 'joints_camspace' in vitra_hand:
-            target_wrist = vitra_hand['joints_camspace'][frame_idx][0]
-        else:
-            target_wrist = wrist_offset
-
-        transl = target_wrist - wrist_offset
-        verts, faces = mano_forward(
-            mano_data, beta, global_orient, hand_pose,
-            transl, is_left=False
-        )
-
-    return verts, faces
-
-
-def sample_hand_colors(vertices, faces, intrinsics, color_img, num_samples=50000):
-    """
-    Sample points on hand mesh surface and color them from the image.
-
-    Args:
-        vertices: (778, 3) hand mesh vertices in camera space
-        faces: (1538, 3) face indices
-        intrinsics: 3x3 camera intrinsics
-        color_img: (H, W, 3) RGB image
-        num_samples: number of surface points to sample
-
-    Returns:
-        points: (num_samples, 3) sampled points in camera space
-        colors: (num_samples, 3) RGB colors
-    """
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    points, face_idx = mesh.sample(num_samples, return_index=True)
-
-    H, W = color_img.shape[:2]
-    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-
-    # Project sampled points to 2D
-    z = points[:, 2]
-    valid_z = z > 0
-    x_2d = np.full(len(points), -1, dtype=np.int32)
-    y_2d = np.full(len(points), -1, dtype=np.int32)
-    x_2d[valid_z] = (fx * points[valid_z, 0] / z[valid_z] + cx).astype(np.int32)
-    y_2d[valid_z] = (fy * points[valid_z, 1] / z[valid_z] + cy).astype(np.int32)
-
-    in_bounds = valid_z & (x_2d >= 0) & (x_2d < W) & (y_2d >= 0) & (y_2d < H)
-
-    # Default skin tone
-    colors = np.tile(np.array([224, 172, 105], dtype=np.uint8), (len(points), 1))
-
-    # Sample actual image colors where projection is valid
-    if in_bounds.any():
-        colors[in_bounds] = color_img[y_2d[in_bounds], x_2d[in_bounds]]
-
-    return points, colors
-
-
 def remove_occluded_points(points_world, intrinsics, pose_c2w, image_shape,
                            depth_tolerance=0.005):
     """
@@ -482,43 +243,6 @@ def project_points_to_mask(points_world, intrinsics, pose_c2w, image_shape, dila
 
     return mask
 
-
-def rasterize_mesh_to_mask(vertices_cam, faces, intrinsics, image_shape):
-    """
-    Rasterize a 3D mesh to a solid 2D mask by filling projected triangles.
-
-    Args:
-        vertices_cam: (V, 3) mesh vertices in camera space
-        faces: (F, 3) triangle face indices
-        intrinsics: 3x3 camera intrinsics
-        image_shape: (H, W) output mask size
-
-    Returns:
-        mask: (H, W) boolean mask with solid filled triangles
-    """
-    H, W = image_shape
-    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-
-    z = vertices_cam[:, 2]
-    valid = z > 0
-
-    # Project all vertices to 2D
-    pts_2d = np.zeros((len(vertices_cam), 2), dtype=np.float32)
-    pts_2d[valid, 0] = (fx * vertices_cam[valid, 0] / z[valid] + cx)
-    pts_2d[valid, 1] = (fy * vertices_cam[valid, 1] / z[valid] + cy)
-
-    # Filter to faces where all 3 vertices are in front of camera
-    face_valid = valid[faces[:, 0]] & valid[faces[:, 1]] & valid[faces[:, 2]]
-    valid_faces = faces[face_valid]
-
-    mask = np.zeros((H, W), dtype=np.uint8)
-    if len(valid_faces) > 0:
-        # Batch rasterize: gather triangle vertices as (N, 3, 2) int32 array
-        triangles = pts_2d[valid_faces].astype(np.int32)  # (N, 3, 2)
-        cv2.fillPoly(mask, triangles, 1)
-
-    return mask.astype(bool)
 
 
 def render_color_from_points(points_world, colors, intrinsics, pose_c2w, image_shape):
@@ -718,11 +442,10 @@ def sh_to_rgb(sh_dc):
     return rgb
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate combined PLY files (Scene + Hand + Objects)")
+    parser = argparse.ArgumentParser(description="Generate combined PLY files (Scene + Objects)")
     parser.add_argument("--ttt3r_out", type=str, required=True, help="Path to TTT3R output directory")
-    parser.add_argument("--wilor_out", type=str, default=None, help="Path to WiLoR output directory (optional)")
     parser.add_argument("--object_dir", type=str, default=None, help="Path to object reconstruction directory (e.g., output_tracked_objects/last_4_seconds)")
-    parser.add_argument("--output_dir", type=str, default="ply_output", help="Directory to save PLY files")
+    parser.add_argument("--output_dir", type=str, default="depth", help="Directory to save PLY files")
     parser.add_argument("--contrast", action="store_true", help="Use bright purple color for objects instead of natural colors")
     parser.add_argument("--stride", type=int, default=1, help="Stride used for frame processing (mapped to original video frame indices)")
     parser.add_argument("--no_object_transform", action="store_true",
@@ -737,9 +460,7 @@ def main():
         help="Mask excision mode: 'original' (SAM3D mask), 'reconstructed' (projected recon footprint), "
              "'intersection' (AND of both), 'all' (generate all three)")
     parser.add_argument("--vitra_annotation", type=str, default=None,
-        help="Path to VITRA annotation .npy file for MANO hand reconstruction")
-    parser.add_argument("--mano_model", type=str, default=None,
-        help="Path to MANO_RIGHT_clean.npz (default: auto-detect)")
+        help="Path to VITRA annotation .npy file (used for frame filtering)")
     parser.add_argument("--skip_visualizations", action="store_true",
         help="Skip rendering PNG depth/color visualizations (saves ~2-5s per frame)")
     parser.add_argument("--export_obj", action="store_true", default=True,
@@ -750,31 +471,14 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load VITRA annotation and MANO model if provided
+    # Load VITRA annotation if provided (for frame filtering)
     vitra_ann = None
-    mano_data = None
-    mano_left_data = None
     if args.vitra_annotation:
         if not os.path.exists(args.vitra_annotation):
             print(f"WARNING: VITRA annotation not found: {args.vitra_annotation}")
         else:
             vitra_ann = np.load(args.vitra_annotation, allow_pickle=True).item()
-            mano_data = load_mano_model(args.mano_model)
-            # Load MANO_LEFT for correct left-hand reconstruction.
-            # NOTE: MANO_LEFT_clean.npz must have the shapedirs[:, 0, :] *= -1 fix
-            # baked in (smplx bug https://github.com/vchoutas/smplx/issues/48).
-            left_model_path = MANO_LEFT_MODEL_PATH
-            if os.path.exists(left_model_path):
-                mano_left_data = load_mano_model(left_model_path)
-                print(f"Loaded MANO_LEFT model for left-hand reconstruction")
-            else:
-                print(f"WARNING: MANO_LEFT_clean.npz not found at {left_model_path}, "
-                      f"left hands will use Procrustes-only alignment")
             print(f"Loaded VITRA annotation: {len(vitra_ann.get('video_decode_frame', []))} frames")
-            for hand_name in ['left', 'right']:
-                if hand_name in vitra_ann:
-                    kf = vitra_ann[hand_name]['kept_frames']
-                    print(f"  {hand_name} hand: {kf.sum()}/{len(kf)} valid frames")
 
     # Get depth files
     depth_dir = os.path.join(args.ttt3r_out, "depth")
@@ -784,13 +488,6 @@ def main():
     depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
 
     print(f"Found {len(depth_files)} frames.")
-
-    # Check if TTT3R output has been rescaled to metric
-    metric_scale_path = os.path.join(args.ttt3r_out, ".metric_scale")
-    is_metric = os.path.exists(metric_scale_path)
-    if is_metric:
-        print("TTT3R output is metric-scaled (hand scaling disabled)")
-    vitra_intrinsics = vitra_ann.get('intrinsics', None) if vitra_ann is not None else None
 
     # Filter out margin frames (frames outside the VITRA annotation range)
     if vitra_ann is not None:
@@ -873,206 +570,7 @@ def main():
             excised_count = exclude_mask.sum()
             print(f"  Excised {excised_count} pixels from scene using object mask")
         
-        # 2. Hand Point Cloud (VITRA MANO or WiLoR)
-        hand_pts_list = []
-        hand_colors_list = []
-        hand_meshes_cam = []  # list of (vertices_cam_scaled, faces) for rasterized masks
-
-        # Compute VITRA-based intrinsics rescaled to depth map resolution for hand projection
-        if vitra_intrinsics is not None:
-            vitra_W = int(round(2 * vitra_intrinsics[0, 2]))
-            vitra_H = int(round(2 * vitra_intrinsics[1, 2]))
-            hand_K = np.array([
-                [vitra_intrinsics[0, 0] * depth_map.shape[1] / vitra_W, 0, vitra_intrinsics[0, 2] * depth_map.shape[1] / vitra_W],
-                [0, vitra_intrinsics[1, 1] * depth_map.shape[0] / vitra_H, vitra_intrinsics[1, 2] * depth_map.shape[0] / vitra_H],
-                [0, 0, 1]
-            ])
-        else:
-            hand_K = intrinsics
-
-        if vitra_ann is not None and mano_data is not None:
-            # VITRA-based hand reconstruction using MANO forward pass
-            # video_decode_frame maps VITRA index → video frame number.
-            # TTT3R frame basename is the video frame number.  Look up
-            # which VITRA index corresponds to this video frame.
-            video_frame_num = int(basename) * args.stride
-            vitra_frame_indices = vitra_ann.get('video_decode_frame', None)
-            vitra_idx = None
-            if vitra_frame_indices is not None:
-                # Rebase absolute vdf to clip-relative for datasets like Epic-Kitchens
-                from rescale_to_metric import _rebase_vdf
-                rebased_vdf = _rebase_vdf(np.asarray(vitra_frame_indices), args.vitra_annotation)
-                matches = np.where(rebased_vdf == video_frame_num)[0]
-                if len(matches) > 0:
-                    vitra_idx = int(matches[0])
-            else:
-                # No video_decode_frame: assume 1:1 mapping
-                vitra_idx = video_frame_num
-                n_vitra = max(len(vitra_ann.get(h, {}).get('kept_frames', [])) for h in ['left', 'right'] if h in vitra_ann)
-                if vitra_idx >= n_vitra:
-                    vitra_idx = None
-            if vitra_idx is None:
-                print(f"  Frame {basename} not in VITRA annotation")
-
-            if vitra_idx is not None:
-                for hand_name, is_left in [('right', False), ('left', True)]:
-                    if hand_name not in vitra_ann:
-                        continue
-                    vitra_hand = vitra_ann[hand_name]
-                    if vitra_idx >= len(vitra_hand['kept_frames']):
-                        continue
-                    if not vitra_hand['kept_frames'][vitra_idx]:
-                        continue
-
-                    # Generate hand mesh in camera space
-                    hand_verts, hand_faces = generate_hand_mesh(
-                        mano_data, vitra_hand, vitra_idx, is_left=is_left,
-                        mano_left_data=mano_left_data
-                    )
-                    if hand_verts is None:
-                        continue
-
-                    # Sample dense points on mesh surface
-                    mesh_tmp = trimesh.Trimesh(vertices=hand_verts, faces=hand_faces, process=False)
-                    hand_pts_cam, _ = mesh_tmp.sample(50000, return_index=True)
-
-                    # Color: sample a single pixel at the hand centroid projection
-                    # Use VITRA intrinsics (rescaled to color image) since MANO was fit with VITRA
-                    if color_img is not None:
-                        centroid_cam = hand_verts.mean(axis=0)
-                        if centroid_cam[2] > 0:
-                            H_c, W_c = color_img.shape[:2]
-                            if vitra_intrinsics is not None:
-                                vitra_W = int(round(2 * vitra_intrinsics[0, 2]))
-                                vitra_H = int(round(2 * vitra_intrinsics[1, 2]))
-                                fx_h = vitra_intrinsics[0, 0] * W_c / vitra_W
-                                fy_h = vitra_intrinsics[1, 1] * H_c / vitra_H
-                                cx_h = vitra_intrinsics[0, 2] * W_c / vitra_W
-                                cy_h = vitra_intrinsics[1, 2] * H_c / vitra_H
-                            else:
-                                fx_h, fy_h = intrinsics[0, 0], intrinsics[1, 1]
-                                cx_h, cy_h = intrinsics[0, 2], intrinsics[1, 2]
-                            cx_px = int(fx_h * centroid_cam[0] / centroid_cam[2] + cx_h)
-                            cy_px = int(fy_h * centroid_cam[1] / centroid_cam[2] + cy_h)
-                            cx_px = np.clip(cx_px, 0, W_c - 1)
-                            cy_px = np.clip(cy_px, 0, H_c - 1)
-                            hand_color = color_img[cy_px, cx_px]
-                        else:
-                            hand_color = np.array([224, 172, 105], dtype=np.uint8)
-                    else:
-                        hand_color = np.array([224, 172, 105], dtype=np.uint8)
-                    hand_colors = np.tile(hand_color, (len(hand_pts_cam), 1))
-
-                    if args.contrast:
-                        hand_colors = np.tile([255, 105, 180], (len(hand_pts_cam), 1))
-
-                    # When TTT3R is metric-scaled, MANO hands are already in
-                    # the same coordinate system — no scaling needed.
-                    # Otherwise fall back to wrist-anchored scaling.
-                    if is_metric:
-                        hand_pts_cam_scaled = hand_pts_cam
-                        hand_verts_cam_scaled = hand_verts
-                    elif vitra_intrinsics is not None:
-                        # Legacy: wrist-anchored scaling for non-metric TTT3R
-                        wrist_cam = vitra_hand['joints_camspace'][vitra_idx][0]
-                        vW = int(round(2 * vitra_intrinsics[0, 2]))
-                        vH = int(round(2 * vitra_intrinsics[1, 2]))
-                        H_d, W_d = depth_map.shape
-                        fxv = vitra_intrinsics[0, 0] * W_d / vW
-                        fyv = vitra_intrinsics[1, 1] * H_d / vH
-                        cxv = vitra_intrinsics[0, 2] * W_d / vW
-                        cyv = vitra_intrinsics[1, 2] * H_d / vH
-
-                        wu = int(np.clip(fxv * wrist_cam[0] / wrist_cam[2] + cxv, 0, W_d - 1))
-                        wv = int(np.clip(fyv * wrist_cam[1] / wrist_cam[2] + cyv, 0, H_d - 1))
-                        d_at_wrist = depth_map[wv, wu]
-
-                        if d_at_wrist > 0 and wrist_cam[2] > 0:
-                            local_scale = float(d_at_wrist / wrist_cam[2])
-                        else:
-                            local_scale = 1.0
-
-                        fxt, fyt = intrinsics[0, 0], intrinsics[1, 1]
-                        cxt, cyt = intrinsics[0, 2], intrinsics[1, 2]
-                        wrist_ttt3r = np.array([
-                            (wu - cxt) * d_at_wrist / fxt,
-                            (wv - cyt) * d_at_wrist / fyt,
-                            d_at_wrist
-                        ])
-
-                        hand_pts_cam_scaled = (hand_pts_cam - wrist_cam) * local_scale + wrist_ttt3r
-                        hand_verts_cam_scaled = (hand_verts - wrist_cam) * local_scale + wrist_ttt3r
-                        print(f"    local_scale={local_scale:.4f} (depth@wrist={d_at_wrist:.4f}, vitra_z={wrist_cam[2]:.4f})")
-                    else:
-                        hand_pts_cam_scaled = hand_pts_cam
-                        hand_verts_cam_scaled = hand_verts
-
-                    hand_meshes_cam.append((hand_verts_cam_scaled, hand_faces))
-
-                    # Transform to world space
-                    hand_pts_world = (pose_c2w[:3, :3] @ hand_pts_cam_scaled.T).T + pose_c2w[:3, 3]
-                    hand_pts_list.append(hand_pts_world)
-                    hand_colors_list.append(hand_colors)
-                    print(f"  {hand_name} hand: {len(hand_pts_world)} points")
-
-        elif args.wilor_out is not None:
-            # Legacy WiLoR-based hand reconstruction
-            hand_files = glob.glob(os.path.join(args.wilor_out, f"{basename}_*.obj"))
-            hand_files = [f for f in hand_files if not f.endswith('_scaled.obj')]
-
-            for hf in hand_files:
-                hand_mesh = trimesh.load(hf)
-                rot_fix = trimesh.transformations.rotation_matrix(np.radians(180), [1, 0, 0])
-                hand_mesh.apply_transform(rot_fix)
-
-                hand_mesh_world = hand_mesh.copy()
-                hand_mesh_world.apply_transform(pose_c2w)
-
-                cam_origin_world = pose_c2w[:3, 3]
-                hand_center_world = hand_mesh_world.vertices.mean(axis=0)
-                wilor_distance = np.linalg.norm(hand_center_world - cam_origin_world)
-
-                hand_center_cam = hand_mesh.vertices.mean(axis=0)
-                fx = intrinsics[0, 0]
-                fy = intrinsics[1, 1]
-                cx_cam = intrinsics[0, 2]
-                cy_cam = intrinsics[1, 2]
-                x_2d = fx * hand_center_cam[0] / hand_center_cam[2] + cx_cam
-                y_2d = fy * hand_center_cam[1] / hand_center_cam[2] + cy_cam
-                x_int = int(np.clip(x_2d, 0, depth_map.shape[1] - 1))
-                y_int = int(np.clip(y_2d, 0, depth_map.shape[0] - 1))
-                ttt3r_depth = depth_map[y_int, x_int]
-
-                point_cam = np.array([
-                    (x_2d - cx_cam) * ttt3r_depth / fx,
-                    (y_2d - cy_cam) * ttt3r_depth / fy,
-                    ttt3r_depth
-                ])
-                point_world = pose_c2w[:3, :3] @ point_cam + cam_origin_world
-                ttt3r_distance = np.linalg.norm(point_world - cam_origin_world)
-                sf = ttt3r_distance / wilor_distance if wilor_distance > 0 else 1.0
-                hand_mesh_world.vertices = (hand_mesh_world.vertices - cam_origin_world) * sf + cam_origin_world
-
-                sampled_pts, face_indices = hand_mesh_world.sample(50000, return_index=True)
-                hand_pts_list.append(sampled_pts)
-
-                N_s = len(sampled_pts)
-                if args.contrast:
-                    hand_colors_list.append(np.tile([255, 105, 180], (N_s, 1)))
-                elif hasattr(hand_mesh_world.visual, 'vertex_colors') and hand_mesh_world.visual.vertex_colors is not None:
-                    vc = hand_mesh_world.visual.vertex_colors[:, :3]
-                    hand_colors_list.append(vc[hand_mesh_world.faces[face_indices][:, 0]])
-                else:
-                    hand_colors_list.append(np.tile([224, 172, 105], (N_s, 1)))
-
-        if hand_pts_list:
-            all_hand_pts = np.concatenate(hand_pts_list, axis=0)
-            all_hand_colors = np.concatenate(hand_colors_list, axis=0)
-            hand_pcd = trimesh.PointCloud(all_hand_pts, colors=all_hand_colors)
-        else:
-            hand_pcd = None
-
-        # 3. Object Reconstructions Point Cloud
+        # 2. Object Reconstructions Point Cloud
         object_pcd_list = []
         if args.object_dir is not None:
             # Check for object subdirectories (object_0, object_1, etc.)
@@ -1223,26 +721,6 @@ def main():
 
         # Combine all point clouds (default: simple concatenation, overridden below by intersection if available)
         combined_pcd = scene_pcd
-
-        # Pre-compute hand mask once — reused in all excision blocks below
-        # After uniform scaling, hand vertices are in TTT3R camera space → use TTT3R intrinsics
-        cached_hand_mask = None
-        if hand_pcd is not None:
-            if hand_meshes_cam:
-                cached_hand_mask = np.zeros(depth_map.shape, dtype=bool)
-                for verts_cam, faces in hand_meshes_cam:
-                    cached_hand_mask |= rasterize_mesh_to_mask(verts_cam, faces, intrinsics, depth_map.shape)
-            else:
-                cached_hand_mask = project_points_to_mask(all_hand_pts, intrinsics, pose_c2w, depth_map.shape, dilate_pixels=0)
-
-        if hand_pcd is not None:
-            # Apply hand intersection excision: excise scene under hand projection, insert hand
-            scene_pts_hand_excised, scene_colors_hand_excised = unproject_depth(
-                depth_map, intrinsics, pose_c2w, color_img, exclude_mask=cached_hand_mask
-            )
-            excised_colors = scene_colors_hand_excised if scene_colors_hand_excised is not None else np.tile([128, 128, 128], (len(scene_pts_hand_excised), 1))
-            combined_pcd = trimesh.PointCloud(scene_pts_hand_excised, colors=excised_colors) + hand_pcd
-            print(f"  Applied hand excision: removed {cached_hand_mask.sum()} scene pixels, inserted {len(all_hand_pts)} hand points")
         for obj_pcd in object_pcd_list:
             combined_pcd = combined_pcd + obj_pcd
 
@@ -1255,17 +733,11 @@ def main():
 
             # Block A: Original mask excision
             if args.mask_mode in ("original", "all"):
-                # Excise both object and hand regions from scene
-                if cached_hand_mask is not None:
-                    orig_excision_mask = exclude_mask | cached_hand_mask
-                else:
-                    orig_excision_mask = exclude_mask
-
                 scene_pts_orig_excised, scene_colors_orig_excised = unproject_depth(
-                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=orig_excision_mask
+                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=exclude_mask
                 )
 
-                # Save excised scene only (object + hand regions removed, no reconstruction)
+                # Save excised scene only (object region removed, no reconstruction)
                 excised_colors = scene_colors_orig_excised if scene_colors_orig_excised is not None else np.tile([128, 128, 128], (len(scene_pts_orig_excised), 1))
                 excised_pcd = trimesh.PointCloud(scene_pts_orig_excised, colors=excised_colors)
                 excised_ply_path = os.path.join(args.output_dir, f"{basename}_excised.ply")
@@ -1283,14 +755,9 @@ def main():
                 filtered_orig_recon_colors = orig_recon_colors[orig_keep]
                 print(f"Original mask filter: kept {orig_keep.sum()}/{len(orig_recon_pts)} reconstructed points")
 
-                # Create point cloud with: excised scene + filtered reconstructed objects + hands
-                replaced_pts_list = [scene_pts_orig_excised, filtered_orig_recon_pts]
-                replaced_colors_list = [excised_colors, filtered_orig_recon_colors]
-                if hand_pts_list:
-                    replaced_pts_list.append(all_hand_pts)
-                    replaced_colors_list.append(all_hand_colors)
-                combined_points = np.concatenate(replaced_pts_list, axis=0)
-                combined_colors = np.concatenate(replaced_colors_list, axis=0)
+                # Create point cloud with: excised scene + filtered reconstructed objects
+                combined_points = np.concatenate([scene_pts_orig_excised, filtered_orig_recon_pts], axis=0)
+                combined_colors = np.concatenate([excised_colors, filtered_orig_recon_colors], axis=0)
 
                 # Save as PLY
                 replaced_pcd = trimesh.PointCloud(combined_points, colors=combined_colors)
@@ -1354,15 +821,9 @@ def main():
 
             # Block B: Reconstructed footprint excision
             if args.mask_mode in ("reconstructed", "all") and recon_mask is not None:
-                # Combine object reconstruction footprint with cached hand mask
-                if cached_hand_mask is not None:
-                    combined_excision_mask = recon_mask | cached_hand_mask
-                else:
-                    combined_excision_mask = recon_mask
-
-                # Unproject original depth with reconstructed object AND hand regions excluded
+                # Unproject original depth with reconstructed object region excluded
                 scene_pts_recon_excised, scene_colors_recon_excised = unproject_depth(
-                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=combined_excision_mask
+                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=recon_mask
                 )
 
                 # Save PLY: scene with reconstructed object footprint removed
@@ -1372,17 +833,12 @@ def main():
                 recon_excised_pcd.export(recon_excised_ply_path)
                 print(f"Saved excised-by-recon PLY: {recon_excised_ply_path}")
 
-                # Save PLY: excised by recon + reconstructed object + hands inserted
+                # Save PLY: excised by recon + reconstructed object inserted
                 pts_list = [scene_pts_recon_excised, recon_obj_pts]
                 colors_list = [recon_excised_colors] + [
                     np.asarray(obj_pcd.colors)[:, :3] if obj_pcd.colors is not None else np.tile([255, 255, 0], (len(obj_pcd.vertices), 1))
                     for obj_pcd in object_pcd_list
                 ]
-
-                # Add hands if available
-                if hand_pts_list:
-                    pts_list.append(all_hand_pts)
-                    colors_list.append(all_hand_colors)
 
                 recon_replaced_pts = np.concatenate(pts_list, axis=0)
                 recon_replaced_colors = np.concatenate(colors_list, axis=0)
@@ -1426,15 +882,10 @@ def main():
             # Block C: Intersection excision (tightest)
             if args.mask_mode in ("intersection", "all") and recon_mask is not None and exclude_mask is not None:
                 intersection_mask = exclude_mask & recon_mask
-                # Add cached hand mask if available
-                if cached_hand_mask is not None:
-                    intersection_excision_mask = intersection_mask | cached_hand_mask
-                else:
-                    intersection_excision_mask = intersection_mask
 
                 # Unproject original depth with intersection mask excluded
                 scene_pts_inter_excised, scene_colors_inter_excised = unproject_depth(
-                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=intersection_excision_mask
+                    depth_map, intrinsics, pose_c2w, color_img, exclude_mask=intersection_mask
                 )
 
                 # Save PLY: scene with intersection mask removed
@@ -1454,17 +905,9 @@ def main():
                 filtered_recon_colors = recon_obj_colors[keep_mask]
                 print(f"Intersection filter: kept {keep_mask.sum()}/{len(recon_obj_pts)} reconstructed points")
 
-                # Save PLY: excised by intersection + filtered reconstructed object + hands inserted
-                inter_pts_list = [scene_pts_inter_excised, filtered_recon_pts]
-                inter_colors_list = [inter_excised_colors, filtered_recon_colors]
-
-                # Add hands if available
-                if hand_pts_list:
-                    inter_pts_list.append(all_hand_pts)
-                    inter_colors_list.append(all_hand_colors)
-
-                inter_replaced_pts = np.concatenate(inter_pts_list, axis=0)
-                inter_replaced_colors = np.concatenate(inter_colors_list, axis=0)
+                # Save PLY: excised by intersection + filtered reconstructed object inserted
+                inter_replaced_pts = np.concatenate([scene_pts_inter_excised, filtered_recon_pts], axis=0)
+                inter_replaced_colors = np.concatenate([inter_excised_colors, filtered_recon_colors], axis=0)
                 inter_replaced_pcd = trimesh.PointCloud(inter_replaced_pts, colors=inter_replaced_colors)
                 inter_replaced_ply_path = os.path.join(args.output_dir, f"{basename}_replaced_by_intersection.ply")
                 inter_replaced_pcd.export(inter_replaced_ply_path)
@@ -1516,10 +959,16 @@ def main():
         print(f"  Occlusion culling: {n_before} → {len(pts)} points "
               f"({n_before - len(pts)} removed, {100*(n_before-len(pts))/max(n_before,1):.1f}%)")
 
-        # Save main PLY
-        out_path = os.path.join(args.output_dir, f"{basename}.ply")
-        combined_pcd.export(out_path)
-        print(f"Saved {out_path}")
+        # Save depth map as .npy (final output with object reconstructions composited in)
+        if len(object_pcd_list) > 0:
+            # Re-render depth from the combined (scene + object) point cloud
+            final_depth = render_depth_from_points(pts, intrinsics, pose_c2w, depth_map.shape)
+        else:
+            # No objects — use intermediate depth as-is
+            final_depth = depth_map
+        depth_npy_path = os.path.join(args.output_dir, f"{basename}.npy")
+        np.save(depth_npy_path, final_depth.astype(np.float32))
+        print(f"Saved {depth_npy_path}")
 
 if __name__ == "__main__":
     main()

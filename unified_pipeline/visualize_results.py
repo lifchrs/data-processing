@@ -9,8 +9,8 @@ Launches a local web server with a Three.js-based viewer showing:
 - Video selector dropdown
 
 Expected directory layout per video:
-    <results_dir>/<video_id>/ply_output/   — PLY point clouds (required)
-    <results_dir>/<video_id>/ttt3r_output/ — color frames + camera poses
+    <results_dir>/<video_id>/depth/          — .npy depth maps (required)
+    <results_dir>/<video_id>/intermediate_depth/ — color frames + camera poses
 
 Usage:
     python visualize_results.py --results_dir batch_ssv2_output
@@ -19,14 +19,17 @@ Usage:
 
 import argparse
 import http.server
+import io
 import json
 import os
 import socketserver
+import struct
 import sys
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import cv2
 import numpy as np
 
 
@@ -40,18 +43,18 @@ def scan_results(results_dir):
         if not os.path.isdir(video_dir):
             continue
 
-        ply_dir = os.path.join(video_dir, "ply_output")
-        color_dir = os.path.join(video_dir, "ttt3r_output", "color")
-        camera_dir = os.path.join(video_dir, "ttt3r_output", "camera")
+        depth_dir = os.path.join(video_dir, "depth")
+        color_dir = os.path.join(video_dir, "intermediate_depth", "color")
+        camera_dir = os.path.join(video_dir, "intermediate_depth", "camera")
         seg_dir = os.path.join(video_dir, "scene_segmentation")
 
-        if not os.path.isdir(ply_dir) or not os.path.isdir(color_dir):
+        if not os.path.isdir(depth_dir) or not os.path.isdir(color_dir):
             continue
 
-        ply_files = sorted([f for f in os.listdir(ply_dir) if f.endswith(".ply") and "_" not in f])
+        depth_npy_files = sorted([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
         color_files = sorted([f for f in os.listdir(color_dir) if f.endswith((".png", ".jpg"))])
 
-        if not ply_files:
+        if not depth_npy_files:
             continue
 
         # Get action text from manifest if available
@@ -65,9 +68,8 @@ def scan_results(results_dir):
                     action_text = item.get("action_text", entry)
                     break
 
-        # Frame basenames (without extension) — intersection of PLY and color
-        ply_basenames = [os.path.splitext(f)[0] for f in ply_files]
-        color_basenames = [os.path.splitext(f)[0] for f in color_files]
+        # Frame basenames (without extension)
+        depth_basenames = [os.path.splitext(f)[0] for f in depth_npy_files]
 
         # Scan SAM3D output for frames with object reconstructions
         sam3d_dir = os.path.join(video_dir, "sam3d_output")
@@ -107,9 +109,9 @@ def scan_results(results_dir):
             except Exception:
                 pass
 
-        # PLY frames are the limiting factor
+        # Depth .npy frames are the limiting factor
         frames = []
-        for bn in ply_basenames:
+        for bn in depth_basenames:
             color_file = None
             for cf in color_files:
                 if os.path.splitext(cf)[0] == bn:
@@ -124,7 +126,7 @@ def scan_results(results_dir):
                     pose = cam_data["pose"].astype(float).tolist()
             frames.append({
                 "basename": bn,
-                "ply": ply_files[ply_basenames.index(bn)],
+                "ply": bn + ".ply",  # virtual — generated on-the-fly from .npy
                 "color": color_file,
                 "pose_c2w": pose,
                 "has_reconstruction": int(bn) in recon_frame_indices,
@@ -191,6 +193,16 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         if not full_path.startswith(os.path.normpath(self.results_dir)):
             self.send_error(403)
             return
+
+        # On-the-fly PLY generation from .npy depth maps
+        if full_path.endswith(".ply") and not os.path.isfile(full_path):
+            content = self._generate_ply_from_npy(full_path)
+            if content is not None:
+                self._send(content, "application/octet-stream")
+                return
+            self.send_error(404)
+            return
+
         if not os.path.isfile(full_path):
             self.send_error(404)
             return
@@ -210,6 +222,112 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         with open(full_path, "rb") as f:
             content = f.read()
         self._send(content, ct)
+
+    def _generate_ply_from_npy(self, ply_path):
+        """Generate a binary PLY point cloud from .npy depth + camera + color.
+
+        Given a request for e.g. <video>/depth/000001.ply, loads:
+          - <video>/depth/000001.npy          (depth map)
+          - <video>/intermediate_depth/camera/000001.npz  (intrinsics + pose)
+          - <video>/intermediate_depth/color/000001.png    (color image)
+        and returns binary PLY bytes.
+        """
+        basename = os.path.splitext(os.path.basename(ply_path))[0]
+        depth_dir = os.path.dirname(ply_path)
+        video_dir = os.path.dirname(depth_dir)
+
+        npy_path = os.path.join(depth_dir, basename + ".npy")
+        if not os.path.isfile(npy_path):
+            return None
+
+        cam_path = os.path.join(video_dir, "intermediate_depth", "camera", basename + ".npz")
+        if not os.path.isfile(cam_path):
+            return None
+
+        depth = np.load(npy_path)
+        cam = np.load(cam_path)
+        intrinsics = cam["intrinsics"]
+        pose_c2w = cam["pose"]
+
+        # Load color image
+        color = None
+        for ext in (".png", ".jpg"):
+            color_path = os.path.join(video_dir, "intermediate_depth", "color", basename + ext)
+            if os.path.isfile(color_path):
+                color = cv2.imread(color_path)
+                if color is not None:
+                    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+                    # Resize color to match depth if needed
+                    if color.shape[:2] != depth.shape[:2]:
+                        color = cv2.resize(color, (depth.shape[1], depth.shape[0]))
+                break
+
+        # Unproject depth to 3D world points
+        H, W = depth.shape
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+        y_grid, x_grid = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+        valid = depth > 0
+
+        # Subsample for performance (limit to ~200k points)
+        valid_count = valid.sum()
+        stride = max(1, int(np.sqrt(valid_count / 200000)))
+        if stride > 1:
+            subsample = np.zeros_like(valid)
+            subsample[::stride, ::stride] = True
+            valid = valid & subsample
+
+        z = depth[valid]
+        x = x_grid[valid]
+        y = y_grid[valid]
+
+        X = (x - cx) * z / fx
+        Y = (y - cy) * z / fy
+        Z = z
+
+        pts_cam = np.stack([X, Y, Z], axis=-1)
+        R = pose_c2w[:3, :3]
+        t = pose_c2w[:3, 3]
+        pts_world = (R @ pts_cam.T).T + t
+
+        if color is not None:
+            colors = color[valid]
+        else:
+            # Gray fallback
+            colors = np.full((len(pts_world), 3), 180, dtype=np.uint8)
+
+        # Build binary PLY
+        n = len(pts_world)
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "end_header\n"
+        )
+        buf = io.BytesIO()
+        buf.write(header.encode("ascii"))
+        pts_f32 = pts_world.astype(np.float32)
+        colors_u8 = colors.astype(np.uint8)
+        # Interleave: x,y,z (12 bytes) + r,g,b (3 bytes) per vertex
+        vertex_data = np.empty(n, dtype=[
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('r', 'u1'), ('g', 'u1'), ('b', 'u1'),
+        ])
+        vertex_data['x'] = pts_f32[:, 0]
+        vertex_data['y'] = pts_f32[:, 1]
+        vertex_data['z'] = pts_f32[:, 2]
+        vertex_data['r'] = colors_u8[:, 0]
+        vertex_data['g'] = colors_u8[:, 1]
+        vertex_data['b'] = colors_u8[:, 2]
+        buf.write(vertex_data.tobytes())
+        return buf.getvalue()
 
     def log_message(self, format, *args):
         super().log_message(format, *args)

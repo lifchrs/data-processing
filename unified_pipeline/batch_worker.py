@@ -909,6 +909,9 @@ def main():
     parser.add_argument("--num_gpus", type=int, default=1,
                         help="Number of GPUs to use. Splits manifest and launches "
                              "one worker per GPU as subprocesses.")
+    parser.add_argument("--make_training_ready", action="store_true",
+                        help="After processing, create depth symlinks and build "
+                             "filtered episode_frame_index for training.")
 
     args = parser.parse_args()
 
@@ -970,7 +973,7 @@ def _run_single(args):
     print(f"Results saved to: {results_path}")
 
     # Post-processing: prepare outputs for training
-    if args.mode == "pi3":
+    if args.make_training_ready and args.mode == "pi3":
         _prepare_for_training(manifest, args.manifest)
 
 
@@ -1078,7 +1081,7 @@ def _run_multi_gpu(args):
     print(f"Merged results: {merged_path}")
 
     # Post-processing: prepare outputs for training
-    if args.mode == "pi3":
+    if args.make_training_ready and args.mode == "pi3":
         with open(args.manifest) as f:
             full_manifest = json.load(f)
         _prepare_for_training(full_manifest, args.manifest)

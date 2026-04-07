@@ -278,7 +278,8 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
 # ---------------------------------------------------------------------------
 
 def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
-                  intrinsics_root=None, apply_scale=False):
+                  intrinsics_root=None, apply_scale=False,
+                  save_conf=False):
     """Load Pi3 model once and process all videos.
 
     For each video:
@@ -344,45 +345,37 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
 
             # Create output dirs
             depth_dir = os.path.join(pi3_out, "depth")
-            color_dir = os.path.join(pi3_out, "color")
             camera_dir = os.path.join(pi3_out, "camera")
-            conf_dir = os.path.join(pi3_out, "conf")
-            for d in [depth_dir, color_dir, camera_dir, conf_dir]:
+            for d in [depth_dir, camera_dir]:
                 os.makedirs(d, exist_ok=True)
 
             # Load frames
             imgs = load_images_as_tensor(effective_video, interval=frame_interval).to(device)
             N, C, H, W = imgs.shape
 
-            # Load original-resolution frames for color output
-            orig_frames = []
-            cap = cv2.VideoCapture(effective_video)
-            frame_idx = 0
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx % frame_interval == 0:
-                    orig_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame_idx += 1
-            cap.release()
-            orig_frames = orig_frames[:N]
-
-            # Clip to VITRA range if available
+            # Clip to VITRA range if available.
+            # For Epic, the input is an extracted clip (frames start at 0)
+            # but we want output filenames to use absolute source-video
+            # frame indices, matching the vdf values.
             clip_offset = 0
+            absolute_frame_offset = 0
             if annotation_path and os.path.exists(annotation_path):
                 annot = np.load(annotation_path, allow_pickle=True).item()
                 vdf = annot.get('video_decode_frame')
                 if vdf is not None and len(vdf) > 0:
+                    # Save absolute offset before rebasing (for Epic: vdf[0],
+                    # for SSv2: 0 since vdf is already clip-relative)
+                    raw_vdf = np.asarray(vdf)
+                    rebased = _rebase_vdf(raw_vdf, annotation_path)
+                    absolute_frame_offset = int(raw_vdf[0]) - int(rebased[0])
+
                     margin = 3
-                    vdf = _rebase_vdf(vdf, annotation_path)
-                    first_idx = vdf[0] // frame_interval
-                    last_idx = vdf[-1] // frame_interval
+                    first_idx = rebased[0] // frame_interval
+                    last_idx = rebased[-1] // frame_interval
                     clip_start = max(0, first_idx - margin)
                     clip_end = min(N - 1, last_idx + margin)
                     n_before = N
                     imgs = imgs[clip_start:clip_end + 1]
-                    orig_frames = orig_frames[clip_start:clip_end + 1]
                     clip_offset = clip_start
                     N = imgs.shape[0]
                     print(f"  Clipping to VITRA range: frames {clip_start}-{clip_end} "
@@ -402,30 +395,28 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
             K = derive_intrinsics(local_points, conf)
 
             # Save per-frame outputs
+            frame_nums = []
             for fi in range(N):
-                frame_num = (fi + clip_offset) * frame_interval
+                frame_num = (fi + clip_offset) * frame_interval + absolute_frame_offset
+                frame_nums.append(frame_num)
                 basename = f"{frame_num:06d}"
 
                 depth = local_points[fi, :, :, 2].copy()
                 depth[depth < 0] = 0
                 np.save(os.path.join(depth_dir, f"{basename}.npy"),
-                        depth.astype(np.float32))
+                        depth.astype(np.float16))
 
                 np.savez(os.path.join(camera_dir, f"{basename}.npz"),
                          pose=camera_poses[fi].astype(np.float64),
                          intrinsics=K.astype(np.float64))
 
-                # Confidence map (sigmoid of raw logits, quantized to 0-255)
-                c = 1.0 / (1.0 + np.exp(-conf[fi, :, :, 0]))
-                np.save(os.path.join(conf_dir, f"{basename}.npy"),
-                        np.clip(c * 255, 0, 255).astype(np.uint8))
-
-                if fi < len(orig_frames):
-                    color = orig_frames[fi]
-                    if color.shape[0] != H or color.shape[1] != W:
-                        color = cv2.resize(color, (W, H))
-                    cv2.imwrite(os.path.join(color_dir, f"{basename}.png"),
-                                cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
+            # Save confidence as a single file (--conf flag)
+            if save_conf:
+                conf_sigmoid = 1.0 / (1.0 + np.exp(-conf[:, :, :, 0]))
+                conf_uint8 = np.clip(conf_sigmoid * 255, 0, 255).astype(np.uint8)
+                np.savez(os.path.join(pi3_out, "conf.npz"),
+                         data=conf_uint8,
+                         frame_indices=np.array(frame_nums, dtype=np.int32))
 
             print(f"  Pi3 done in {time.time() - t_start:.1f}s ({N} frames)")
 
@@ -451,9 +442,9 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                 annot = np.load(annotation_path, allow_pickle=True).item()
                 vdf_raw = annot.get('video_decode_frame')
                 if vdf_raw is not None:
-                    rebased = _rebase_vdf(np.asarray(vdf_raw), annotation_path)
-                    vdf_set = set(int(v) for v in rebased)
-                    for subdir in ["depth", "color", "camera"]:
+                    # Use raw (absolute) vdf since filenames are now absolute
+                    vdf_set = set(int(v) for v in np.asarray(vdf_raw))
+                    for subdir in ["depth", "camera"]:
                         d = os.path.join(pi3_out, subdir)
                         if not os.path.isdir(d):
                             continue
@@ -476,7 +467,7 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                 cp = os.path.join(camera_dir, f"{bn}.npz")
                 if not os.path.exists(cp):
                     continue
-                depth_map = np.load(dp)
+                depth_map = np.load(dp).astype(np.float32)
                 cam_data = np.load(cp)
                 pose_c2w = cam_data["pose"]
                 intr = cam_data["intrinsics"]
@@ -503,7 +494,7 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                     depth_flat = depth_map.ravel()
                     depth_flat[occluded_indices] = 0
                     np.save(dp, depth_flat.reshape(depth_map.shape)
-                            .astype(np.float32))
+                            .astype(np.float16))
             if n_culled_total > 0:
                 print(f"  Occlusion culling: removed {n_culled_total} points "
                       f"across {len(depth_files_post)} frames")
@@ -985,6 +976,8 @@ def main():
     parser.add_argument("--skip_visualizations", action="store_true")
     parser.add_argument("--apply_scale", action="store_true",
                         help="Apply metric scale to depth/camera files in-place")
+    parser.add_argument("--conf", action="store_true",
+                        help="Save Pi3 confidence maps (single conf.npz per episode)")
     parser.add_argument("--intrinsics_root", type=str, default=None,
                         help="Root dir for intrinsics (ego4d/*.npy, egoexo4d/*.json)")
     parser.add_argument("--results_file", type=str, default=None,
@@ -1031,6 +1024,7 @@ def _run_single(args):
             pi3_ckpt=args.pi3_ckpt,
             intrinsics_root=args.intrinsics_root,
             apply_scale=args.apply_scale,
+            save_conf=args.conf,
         )
     else:
         results = run_sam3d_batch(

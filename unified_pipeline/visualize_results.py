@@ -36,7 +36,7 @@ import trimesh
 from rescale_to_metric import load_metric_scale, _get_hand_vertices
 from visualize_hand_overlay import (
     load_mano_model, generate_hand_points,
-    MANO_RIGHT_PATH, MANO_LEFT_PATH, _rebase_vdf,
+    MANO_RIGHT_PATH, MANO_LEFT_PATH,
 )
 
 
@@ -82,22 +82,160 @@ def _find_episode_dirs(results_dir):
     return found
 
 
+def _find_source_video(annotation_path):
+    """Find the source video for an annotation (Epic Kitchens / SSv2).
+
+    For Epic, finds the source .MP4 in common locations.
+    For SSv2, finds the .webm/.mp4 in the SSv2 video directory.
+    """
+    import re
+    basename = os.path.basename(annotation_path)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+
+    if basename.startswith("epic_kitchens_"):
+        m = re.match(r"epic_kitchens_(P\d+)_(\d+)", basename)
+        if m:
+            participant = m.group(1)
+            vid_name = f"{participant}_{m.group(2)}"
+            for base in [
+                os.path.join(project_root, "DATA", "epic_kitchens_batch_1"),
+                os.path.join(project_root, "vitra_data", "epic_videos", "EPIC-KITCHENS"),
+            ]:
+                path = os.path.join(base, participant, "videos", f"{vid_name}.MP4")
+                if os.path.exists(path):
+                    return path
+
+    elif basename.startswith("somethingsomethingv2_"):
+        m = re.match(r"somethingsomethingv2_(\d+)", basename)
+        if m:
+            vid_id = m.group(1)
+            ssv2_dir = os.path.join(project_root, "VITRA", "20bn-something-something-v2")
+            for ext in [".webm", ".mp4"]:
+                path = os.path.join(ssv2_dir, vid_id + ext)
+                if os.path.exists(path):
+                    return path
+
+    return None
+
+
+def _extract_color_frames(video_path, recon_dir, depth_basenames,
+                           annotation_path=None):
+    """Extract color frames from video for visualization.
+
+    If annotation_path is provided and the video is a source video (not a
+    clip), uses video_decode_frame to seek to the correct frames.
+
+    Resizes to match Pi3's processing resolution (from depth map shape).
+    """
+    color_dir = os.path.join(recon_dir, "color")
+    os.makedirs(color_dir, exist_ok=True)
+
+    # Get target resolution from first depth map
+    depth_dir = os.path.join(recon_dir, "depth")
+    sample_depth = np.load(os.path.join(depth_dir, depth_basenames[0] + ".npy"))
+    target_h, target_w = sample_depth.shape
+
+    frame_set = set(int(bn) for bn in depth_basenames)
+
+    # Determine if we need a frame offset (source video vs clip)
+    frame_offset = 0
+    if annotation_path and os.path.exists(annotation_path):
+        ann = np.load(annotation_path, allow_pickle=True).item()
+        vdf = ann.get("video_decode_frame")
+        if vdf is not None and len(vdf) > 0:
+            # Check if depth basenames are clip-relative (start near 0)
+            # vs absolute (start at vdf[0])
+            min_depth_frame = min(frame_set)
+            if min_depth_frame < vdf[0]:
+                # Depth frames are clip-relative, video is source
+                frame_offset = int(vdf[0])
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  WARNING: Cannot open video {video_path}")
+        return
+
+    n_saved = 0
+    for bn in depth_basenames:
+        fi = int(bn)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi + frame_offset)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        if frame.shape[0] != target_h or frame.shape[1] != target_w:
+            frame = cv2.resize(frame, (target_w, target_h),
+                               interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(os.path.join(color_dir, f"{fi:06d}.png"), frame)
+        n_saved += 1
+
+    cap.release()
+    print(f"  Extracted {n_saved} color frames from {os.path.basename(video_path)}")
+
+
 def scan_results(results_dir):
     """Scan results directory and build a manifest of available data."""
     results_dir = os.path.abspath(results_dir)
     videos = {}
 
-    for entry, video_dir, recon_dir in _find_episode_dirs(results_dir):
+    # Load manifest for video paths (needed for color extraction)
+    manifest_data = []
+    manifest_path = os.path.join(results_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest_data = json.load(f)
+
+    all_episodes = _find_episode_dirs(results_dir)
+
+    # Parallel color extraction for episodes missing color frames
+    extractions = []
+    for entry, video_dir, recon_dir in all_episodes:
+        depth_dir = os.path.join(recon_dir, "depth")
+        color_dir = os.path.join(recon_dir, "color")
+        if not os.path.isdir(depth_dir):
+            continue
+        if os.path.isdir(color_dir) and any(
+                f.endswith((".png", ".jpg")) for f in os.listdir(color_dir)):
+            continue
+        depth_npy_files = sorted([f for f in os.listdir(depth_dir)
+                                  if f.endswith(".npy")])
+        if not depth_npy_files:
+            continue
+        episode_basename = os.path.basename(entry)
+        video_path = None
+        annotation_path = None
+        for item in manifest_data:
+            vn = item.get("video_name", "")
+            if vn == entry or vn == episode_basename:
+                video_path = item.get("video_path")
+                annotation_path = item.get("annotation_path")
+                break
+        if video_path and not os.path.exists(video_path) and annotation_path:
+            video_path = _find_source_video(annotation_path)
+        if video_path and os.path.exists(video_path):
+            depth_basenames = [os.path.splitext(f)[0] for f in depth_npy_files]
+            extractions.append((video_path, recon_dir, depth_basenames,
+                                annotation_path))
+
+    if extractions:
+        from concurrent.futures import ThreadPoolExecutor
+        n_workers = min(len(extractions), len(os.sched_getaffinity(0)))
+        print(f"Extracting color for {len(extractions)} episodes "
+              f"({n_workers} threads)...")
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            pool.map(lambda args: _extract_color_frames(*args), extractions)
+
+    for entry, video_dir, recon_dir in all_episodes:
         depth_dir = os.path.join(recon_dir, "depth")
         color_dir = os.path.join(recon_dir, "color")
         camera_dir = os.path.join(recon_dir, "camera")
         seg_dir = os.path.join(video_dir, "scene_segmentation")
 
-        if not os.path.isdir(depth_dir) or not os.path.isdir(color_dir):
+        if not os.path.isdir(depth_dir):
             continue
 
         depth_npy_files = sorted([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
-        color_files = sorted([f for f in os.listdir(color_dir) if f.endswith((".png", ".jpg"))])
+        color_files = sorted([f for f in os.listdir(color_dir) if f.endswith((".png", ".jpg"))]) if os.path.isdir(color_dir) else []
 
         if not depth_npy_files:
             continue
@@ -136,10 +274,8 @@ def scan_results(results_dir):
         # the manifest.  The old code hardcoded SSv2 annotation paths, which
         # meant Epic Kitchen / Ego4D clips never got has_hand=True.
         #
-        # hand_frame_indices uses annotation index ``vi`` (0-based), which
-        # matches depth frame basenames (000000, 000001, ...) after vdf
-        # rebasing.  We do NOT use raw vdf values here — those are absolute
-        # source-video frame indices for Epic/Ego4D.
+        # hand_frame_indices uses absolute vdf values to match depth
+        # basenames (which are now absolute source-video frame indices).
         hand_frame_indices = set()
         annotation_path = None
         corrected_dir = os.path.join(video_dir, "corrected_annotations")
@@ -148,9 +284,9 @@ def scan_results(results_dir):
             if npy_files:
                 annotation_path = os.path.join(corrected_dir, npy_files[0])
         if annotation_path is None and os.path.exists(manifest_path):
-            # Try annotation_path from manifest
             for item in manifest:
-                if item.get("video_name") == entry:
+                vn = item.get("video_name", "")
+                if vn == entry or vn == episode_basename:
                     ap = item.get("annotation_path")
                     if ap and os.path.exists(ap):
                         annotation_path = ap
@@ -158,13 +294,13 @@ def scan_results(results_dir):
         if annotation_path is not None:
             try:
                 ann = np.load(annotation_path, allow_pickle=True).item()
-                n_frames = len(ann.get("video_decode_frame", []))
+                vdf_raw = ann.get("video_decode_frame", [])
                 for hand_key in ["left", "right"]:
                     if hand_key in ann:
                         kept = ann[hand_key].get("kept_frames", np.array([]))
-                        for vi in range(min(n_frames, len(kept))):
+                        for vi in range(min(len(vdf_raw), len(kept))):
                             if kept[vi]:
-                                hand_frame_indices.add(vi)
+                                hand_frame_indices.add(int(vdf_raw[vi]))
             except Exception:
                 pass
 
@@ -200,10 +336,23 @@ def scan_results(results_dir):
         # Reconstruction subdir name (reconstruction/ or intermediate_depth/)
         recon_subdir = os.path.basename(recon_dir)
 
+        # Compute vertical FOV from intrinsics for camera follow
+        import math
+        fov_y = 60.0  # default
+        if depth_basenames:
+            cam_path_fov = os.path.join(camera_dir, depth_basenames[0] + ".npz")
+            if os.path.exists(cam_path_fov):
+                cam_fov = np.load(cam_path_fov)
+                if "intrinsics" in cam_fov:
+                    fy = cam_fov["intrinsics"][1, 1]
+                    cy = cam_fov["intrinsics"][1, 2]
+                    fov_y = 2 * math.degrees(math.atan(cy / fy))
+
         videos[entry] = {
             "video_id": entry,
             "action_text": action_text,
             "recon_dir": recon_subdir,
+            "fov_y": round(fov_y, 1),
             "num_frames": len(frames),
             "num_color_frames": len(color_files),
             "frames": frames,
@@ -376,7 +525,7 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         if not os.path.isfile(cam_path):
             return None
 
-        depth = np.load(npy_path)
+        depth = np.load(npy_path).astype(np.float32)
         cam = np.load(cam_path)
         intrinsics = cam["intrinsics"]
         pose_c2w = cam["pose"].copy()
@@ -442,13 +591,9 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         # Camera-space coordinates are intrinsics-independent: they represent
         # physical metric positions relative to the camera center.
         #
-        # Frame indexing: depth files are named 000000..N (clip-relative).
-        # For Epic/Ego4D, vdf contains absolute source-video frame indices
-        # which must be rebased (subtract vdf[0]) to match clip-relative
-        # depth filenames.  The annotation index ``vi`` (row in joints_camspace)
-        # maps to rebased vdf[vi].
-        # Use relative path from results_dir to handle nested layouts
-        # (e.g. epic/kitchens_P01_01_ep_000000)
+        # Frame indexing: depth files use absolute source-video frame indices
+        # (matching vdf values directly).  Annotation index ``vi`` is the row
+        # in joints_camspace — find it by matching frame_idx against vdf.
         video_rel = os.path.relpath(video_dir, self.results_dir)
         ann, ann_path = _get_annotation(self.results_dir, video_rel)
         if ann is not None:
@@ -458,9 +603,8 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
             # Map depth frame index → annotation index (vi)
             vdf = ann.get("video_decode_frame")
             if vdf is not None:
-                rebased = _rebase_vdf(np.asarray(vdf), ann_path)
                 vi = None
-                for i, vf in enumerate(rebased):
+                for i, vf in enumerate(np.asarray(vdf)):
                     if int(vf) == frame_idx:
                         vi = i
                         break

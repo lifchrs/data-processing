@@ -41,7 +41,7 @@ def run_batch_phases(manifest_path, output_dir, num_gpus=1, gpu_ids=None,
                      skip_reconstruction=False, skip_scene_seg=False,
                      skip_sam3d=False, skip_combine=False,
                      skip_visualizations=False, apply_scale=False,
-                     create_filtered_index=False):
+                     create_filtered_index=False, save_conf=False):
     """Run reconstruction and SAM3D batch phases, optionally across multiple GPUs.
 
     Each GPU gets a shard of the manifest and loads models independently.
@@ -86,6 +86,8 @@ def run_batch_phases(manifest_path, output_dir, num_gpus=1, gpu_ids=None,
             pi3_extra.append("--apply_scale")
         if create_filtered_index:
             pi3_extra.append("--create_filtered_index")
+        if save_conf:
+            pi3_extra.append("--conf")
         if recon_method == "pi3":
             _launch_phase("pi3", shard_info, output_dir,
                           env_name=pi3_env, frame_interval=frame_interval,

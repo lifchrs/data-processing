@@ -508,7 +508,9 @@ def rescale_to_metric_scale(recon_dir, annotation_path, results_dir=None,
         print("  WARNING: No video_decode_frame in annotation, skipping rescale")
         return None
 
-    vdf = _rebase_vdf(vdf, annotation_path)
+    # Use raw (absolute) vdf for filenames — depth files are named with
+    # absolute source-video frame indices for both SSv2 and Epic.
+    vdf = np.asarray(vdf)
 
     depth_dir = os.path.join(recon_dir, "depth")
     camera_dir = os.path.join(recon_dir, "camera")
@@ -529,7 +531,7 @@ def rescale_to_metric_scale(recon_dir, annotation_path, results_dir=None,
         cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
         if not os.path.exists(depth_path) or not os.path.exists(cam_path):
             continue
-        depth_map = np.load(depth_path)
+        depth_map = np.load(depth_path).astype(np.float32)
         recon_K = np.load(cam_path)["intrinsics"]
         for hand_name, vi, joints in hands_info:
             is_left = (hand_name == "left")
@@ -560,7 +562,7 @@ def rescale_to_metric_scale(recon_dir, annotation_path, results_dir=None,
         depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
         for dp in depth_files:
             d = np.load(dp)
-            np.save(dp, (d / global_scale).astype(np.float32))
+            np.save(dp, (d / global_scale).astype(np.float16))
 
         camera_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
         for cp in camera_files:
@@ -586,7 +588,7 @@ def rescale_to_metric_scale(recon_dir, annotation_path, results_dir=None,
             cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
             if not os.path.exists(depth_path) or not os.path.exists(cam_path):
                 continue
-            depth_map = np.load(depth_path)
+            depth_map = np.load(depth_path).astype(np.float32)
             recon_K = np.load(cam_path)["intrinsics"]
             frame_samples = []
             for hand_name, vi, joints in hands_info:
@@ -623,12 +625,9 @@ def _collect_frame_hands(annotation, vdf):
     Frame indexing convention:
       - ``vi`` = VITRA annotation index (0-based row into joints_camspace,
         kept_frames, etc.).  This is the temporal index within the episode.
-      - ``vf`` = video frame index as stored in video_decode_frame.  For
-        datasets with absolute indices (Epic, Ego4D, EgoExo4D), vdf must be
-        rebased to clip-relative indices BEFORE calling this function (see
-        ``_rebase_vdf``).  After rebasing, vf == vi for contiguous clips,
-        but they can differ if frames were subsampled.
-      - Depth/color/camera files are named ``{vf:06d}.npy/.png/.npz``.
+      - ``vf`` = video frame index from video_decode_frame (absolute source-
+        video frame index).  Depth/camera files are named ``{vf:06d}.npy``.
+      - Both SSv2 and Epic use absolute frame indices in output filenames.
 
     Args:
         annotation: VITRA annotation dict
@@ -693,7 +692,7 @@ def _correct_hand_positions(recon_dir, annotation_path, results_dir,
     if vdf is None:
         return
 
-    vdf = _rebase_vdf(vdf, annotation_path)
+    vdf = np.asarray(vdf)  # absolute frame indices (matches depth filenames)
     frame_hands = _collect_frame_hands(annotation, vdf)
     if not frame_hands:
         return
@@ -715,7 +714,7 @@ def _correct_hand_positions(recon_dir, annotation_path, results_dir,
         if not os.path.exists(depth_path) or not os.path.exists(cam_path):
             continue
 
-        depth_map = np.load(depth_path)
+        depth_map = np.load(depth_path).astype(np.float32)
         recon_K = np.load(cam_path)["intrinsics"]
 
         for hand_name, vi, joints in hands_info:

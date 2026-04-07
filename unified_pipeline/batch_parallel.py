@@ -214,7 +214,10 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
                     epic_video_dir = default
                 break
 
+    # First pass: resolve metadata and identify clips that need extraction
     episodes = []
+    clips_to_extract = []  # (index, video_name, annotation, epic_video_dir, output_dir)
+
     for entry in input_entries:
         annot_path = entry["annotation_path"]
         if not os.path.isabs(annot_path):
@@ -247,11 +250,11 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
                 print(f"WARNING: SSv2 video not found for {video_name}, skipping")
                 continue
         elif dataset == "epic":
-            video_path = _resolve_epic_video(
-                video_name, annotation, epic_video_dir, output_dir)
-            if video_path is None:
-                print(f"WARNING: Epic video not found/extracted for {video_name}, skipping")
-                continue
+            # Defer clip extraction for parallel processing
+            idx = len(episodes)
+            video_path = None  # placeholder
+            clips_to_extract.append(
+                (idx, video_name, annotation, epic_video_dir, output_dir))
         else:
             if video_path is None:
                 print(f"WARNING: No video_path for {dataset} annotation "
@@ -266,6 +269,32 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
             "dataset": dataset,
             "action_text": action_text,
         })
+
+    # Parallel clip extraction for Epic Kitchens
+    if clips_to_extract:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _extract_one(args):
+            idx, vname, ann, edir, odir = args
+            return idx, _resolve_epic_video(vname, ann, edir, odir)
+
+        n_workers = min(len(clips_to_extract), len(os.sched_getaffinity(0)))
+        print(f"Extracting {len(clips_to_extract)} Epic clips "
+              f"({n_workers} threads)...")
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_extract_one, c): c
+                       for c in clips_to_extract}
+            for future in as_completed(futures):
+                idx, clip_path = future.result()
+                if clip_path is None:
+                    vname = clips_to_extract[idx][1] if idx < len(clips_to_extract) else "?"
+                    print(f"WARNING: Epic clip extraction failed for {vname}")
+                else:
+                    episodes[idx]["video_path"] = clip_path
+
+        # Remove episodes where clip extraction failed
+        episodes = [ep for ep in episodes if ep["video_path"] is not None]
 
     return episodes
 
@@ -313,6 +342,8 @@ def main():
     parser.add_argument("--create_filtered_index", action="store_true",
                         help="Create filtered episode_frame_index.npz for training "
                              "(only includes episodes in this batch)")
+    parser.add_argument("--conf", action="store_true",
+                        help="Save Pi3 confidence maps (single conf.npz per episode)")
 
     # Conda envs
     parser.add_argument("--ttt3r_env", type=str, default="ttt3r")
@@ -425,6 +456,7 @@ def main():
         skip_visualizations=args.skip_visualizations,
         apply_scale=args.apply_scale,
         create_filtered_index=args.create_filtered_index,
+        save_conf=args.conf,
     )
     batch_elapsed = time.time() - batch_start
 

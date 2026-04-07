@@ -271,6 +271,11 @@ function selectVideo(videoId) {
   currentVideo._sceneComputed = false;
   currentFrameIdx = 0;
 
+  // Set camera FOV to match reconstruction intrinsics
+  const fov = currentVideo.fov_y || 60;
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+
   actionLabel.textContent = currentVideo.action_text;
   timeSlider.max = currentVideo.num_frames - 1;
   timeSlider.value = 0;

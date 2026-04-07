@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Run Pi3 scene reconstruction and save output in TTT3R-compatible format.
+Run Pi3 scene reconstruction and save output as depth/color/camera directories.
 
 Pi3 outputs global points, local points (camera-space), camera poses, and
 confidence. This script converts them into the depth/color/camera directory
 structure expected by the rest of the pipeline.
 
-Pi3 produces metric-scale output, so a `.metric_scale` marker is written
-to skip the Procrustes hand alignment in downstream steps.
+The metric scale factor is computed separately by ``rescale_to_metric.py``
+and saved to ``metric_scale.txt`` (non-destructive — depth files are not
+overwritten).
 
 Usage:
     python run_pi3.py --video input.mp4 --output_dir pi3_output
@@ -200,9 +201,6 @@ def run_pi3_inference(video_path, output_dir, frame_interval=1, device="cuda",
 
         # Depth: z-component of local points
         depth = local_points_np[i, :, :, 2].copy()  # (H, W)
-        # Zero out low-confidence pixels
-        c = 1.0 / (1.0 + np.exp(-conf_np[i, :, :, 0]))
-        depth[c < 0.1] = 0
         depth[depth < 0] = 0
         np.save(os.path.join(depth_dir, f"{basename}.npy"), depth.astype(np.float32))
 

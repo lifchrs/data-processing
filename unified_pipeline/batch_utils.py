@@ -40,7 +40,8 @@ def run_batch_phases(manifest_path, output_dir, num_gpus=1, gpu_ids=None,
                      frame_interval=1,
                      skip_reconstruction=False, skip_scene_seg=False,
                      skip_sam3d=False, skip_combine=False,
-                     skip_visualizations=False):
+                     skip_visualizations=False, apply_scale=False,
+                     create_filtered_index=False):
     """Run reconstruction and SAM3D batch phases, optionally across multiple GPUs.
 
     Each GPU gets a shard of the manifest and loads models independently.
@@ -80,17 +81,26 @@ def run_batch_phases(manifest_path, output_dir, num_gpus=1, gpu_ids=None,
 
     # Phase 1: Scene Reconstruction (TTT3R or Pi3)
     if not skip_reconstruction:
+        pi3_extra = []
+        if apply_scale:
+            pi3_extra.append("--apply_scale")
+        if create_filtered_index:
+            pi3_extra.append("--create_filtered_index")
         if recon_method == "pi3":
             _launch_phase("pi3", shard_info, output_dir,
                           env_name=pi3_env, frame_interval=frame_interval,
-                          get_python_cmd=get_python_cmd, get_env_vars=get_env_vars)
+                          get_python_cmd=get_python_cmd, get_env_vars=get_env_vars,
+                          extra_flags=pi3_extra if pi3_extra else None)
         else:
             _launch_phase("ttt3r", shard_info, output_dir,
                           env_name=ttt3r_env, frame_interval=frame_interval,
                           get_python_cmd=get_python_cmd, get_env_vars=get_env_vars)
 
-    # Phase 2: SAM3D (steps 3-4)
-    if not (skip_sam3d and skip_combine):
+    # Phase 2: SAM3D (steps 3-4) — only runs if at least one sub-step is needed.
+    # By default, reconstruction + metric rescaling (Phase 1) is sufficient.
+    # SAM3D/scene-seg/combine are opt-in for object detection & segmentation.
+    all_phase2_skipped = skip_sam3d and skip_combine and skip_scene_seg
+    if not all_phase2_skipped:
         extra_flags = []
         if skip_scene_seg:
             extra_flags.append("--skip_scene_seg")

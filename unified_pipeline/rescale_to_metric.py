@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Rescale reconstructed depth maps and camera poses to metric scale using VITRA hand joints.
+Compute metric scale factor for reconstructed depth maps using VITRA hand joints.
 
-The reconstruction (Pi3/TTT3R) outputs depth in an arbitrary, globally-consistent
+The reconstruction (Pi3) outputs depth in an arbitrary, globally-consistent
 scale. VITRA provides metric 3D hand joints in camera space. We align depth to
 the hand joints in two steps:
 
-  1. Global scale: median ratio of recon_depth / joint_z across all joints and
-     frames, applied uniformly to all depth maps and camera translations.
-     This puts everything in approximate metric (meters).
+  1. Global scale: median ratio of recon_depth / joint_z across all MANO mesh
+     vertices and frames. This single scalar is saved to ``metric_scale.txt``
+     and applied on-the-fly by readers (non-destructive — depth files are
+     never overwritten).
   2. Per-frame hand correction: for each frame with valid hand joints, compute a
      z-offset that aligns the hand's wrist to the depth surface, then save the
      corrected joint positions. This adjusts hand *position* only — hand
@@ -16,17 +17,55 @@ the hand joints in two steps:
      physical ruler across all videos.
 
 Usage (standalone):
-    python rescale_to_metric.py --ttt3r_out path/to/intermediate_depth --annotation path/to/annot.npy
+    python rescale_to_metric.py --recon_dir path/to/reconstruction --annotation path/to/annot.npy
 
 Or as a library:
-    from rescale_to_metric import rescale_ttt3r_to_metric
-    scale = rescale_ttt3r_to_metric(ttt3r_out_dir, annotation_path)
+    from rescale_to_metric import rescale_to_metric_scale, load_metric_scale
+    scale = rescale_to_metric_scale(recon_dir, annotation_path)
+    # Later, when reading depth:
+    metric_scale = load_metric_scale(recon_dir)
+    depth_metric = raw_depth / metric_scale
 """
 
 import glob
 import os
 
 import numpy as np
+
+
+def load_metric_scale(recon_dir, frame_idx=None):
+    """Load the metric scale factor.
+
+    If per-frame scales exist (metric_scale_per_frame.json), returns the
+    scale for the given frame_idx.  Otherwise falls back to the global
+    scale from metric_scale.txt.  Returns 1.0 if no scale file exists.
+
+    Args:
+        recon_dir: Path to reconstruction directory.
+        frame_idx: Frame index (int) for per-frame lookup.  If None,
+                   returns the global scale.
+    """
+    import json as _json
+
+    # Per-frame scale (preferred for debugging / tight alignment)
+    pf_path = os.path.join(recon_dir, "metric_scale_per_frame.json")
+    if os.path.exists(pf_path):
+        with open(pf_path) as f:
+            per_frame = _json.load(f)
+        if frame_idx is not None:
+            key = str(frame_idx)
+            if key in per_frame:
+                return float(per_frame[key])
+        # Fall back to global if frame not found
+        if "global" in per_frame:
+            return float(per_frame["global"])
+
+    # Global scale
+    p = os.path.join(recon_dir, "metric_scale.txt")
+    if os.path.exists(p):
+        return float(open(p).read().strip())
+    return 1.0
+
 
 # MANO model paths
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,10 +124,112 @@ def _mano_forward(mano_data, beta, global_orient, hand_pose, transl):
     return v_out
 
 
-def _get_hand_vertices(hand_dict, vi, is_left):
+def _rasterize_hand_zbuffer(verts, faces, recon_K, image_shape,
+                            n_samples=200000, supersample=8):
+    """Build a z-buffer of the MANO mesh via dense surface sampling.
+
+    Densely samples points on the mesh surface, projects them to a
+    supersampled 2D grid, and keeps the minimum depth per pixel.  The
+    supersampled z-buffer is then downsampled (min-pool) to the target
+    resolution.  Fully vectorized (no Python loops).
+
+    Supersampling ensures that thin structures (fingers) and silhouette
+    edges are properly represented without gaps that would let occluded
+    vertices leak through.
+
+    Args:
+        verts: (V, 3) camera-space vertices
+        faces: (F, 3) triangle indices
+        recon_K: 3x3 reconstruction intrinsics
+        image_shape: (H, W) for the final z-buffer resolution
+        n_samples: number of surface samples (default 50K)
+        supersample: resolution multiplier (default 4x)
+
+    Returns:
+        zbuf: (H, W) array, inf where no surface covers the pixel
+    """
+    import trimesh
+
+    H, W = image_shape
+    Hs, Ws = H * supersample, W * supersample
+    fx, fy = recon_K[0, 0] * supersample, recon_K[1, 1] * supersample
+    cx, cy = recon_K[0, 2] * supersample, recon_K[1, 2] * supersample
+
+    # Densely sample surface points (vectorized in trimesh)
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    pts, _ = mesh.sample(n_samples, return_index=True)
+
+    # Include original vertices
+    pts = np.vstack([pts, verts])
+
+    # Project to supersampled 2D (vectorized)
+    z = pts[:, 2]
+    valid = z > 0.01
+    u = np.full(len(pts), -1, dtype=np.int32)
+    v = np.full(len(pts), -1, dtype=np.int32)
+    u[valid] = np.round(fx * pts[valid, 0] / z[valid] + cx).astype(np.int32)
+    v[valid] = np.round(fy * pts[valid, 1] / z[valid] + cy).astype(np.int32)
+
+    in_bounds = valid & (u >= 0) & (u < Ws) & (v >= 0) & (v < Hs)
+    idx = np.where(in_bounds)[0]
+
+    # Build supersampled z-buffer
+    zbuf_hi = np.full((Hs, Ws), np.inf, dtype=np.float64)
+    np.minimum.at(zbuf_hi, (v[idx], u[idx]), z[idx])
+
+    # Downsample to target resolution (min-pool: take minimum depth in
+    # each supersample x supersample block)
+    zbuf = zbuf_hi.reshape(H, supersample, W, supersample).min(axis=(1, 3))
+
+    return zbuf
+
+
+def _get_visible_hand_vertices(verts, faces, recon_K, image_shape):
+    """Return only vertices on camera-facing faces (normal-based culling).
+
+    For each face, computes the dot product of the face normal with the
+    view direction (camera origin to face centroid).  Faces with negative
+    dot product have normals pointing toward the camera and are visible.
+    Vertices belonging to at least one visible face are kept.
+
+    This is fast (~1ms) and handles most visibility cases.  It does not
+    handle self-occlusion from curled fingers, but those outliers are
+    filtered by the IQR-based robust median in the scale computation.
+
+    Args:
+        verts: (V, 3) camera-space vertices
+        faces: (F, 3) triangle indices
+        recon_K: unused (kept for API compatibility)
+        image_shape: unused (kept for API compatibility)
+
+    Returns:
+        visible_verts: (N, 3) subset of verts on front-facing faces
+    """
+    import trimesh
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    # View direction = camera origin (0,0,0) to face centroid (= centroid itself)
+    centroids = verts[faces].mean(axis=1)
+    view_dirs = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10)
+    dots = np.sum(view_dirs * mesh.face_normals, axis=1)
+
+    # Front-facing: normal points toward camera (dot < 0)
+    front_vert_ids = np.unique(faces[dots < 0])
+    return verts[front_vert_ids]
+
+
+def _get_hand_vertices(hand_dict, vi, is_left, recon_K=None, image_shape=None):
     """Generate MANO mesh vertices for one hand at one frame.
 
-    Returns (778, 3) camera-space vertices, or None if frame is invalid.
+    If recon_K and image_shape are provided, performs proper visibility
+    testing via z-buffer rasterization — only vertices on the frontmost
+    visible surface are returned.  This handles all self-occlusion cases
+    (e.g., curled fingers in front of palm).
+
+    Without recon_K/image_shape, returns all vertices (no culling).
+
+    Returns camera-space vertices, or None if frame is invalid or MANO
+    model is not available.
     """
     kept = hand_dict['kept_frames']
     if vi >= len(kept) or not kept[vi]:
@@ -103,6 +244,7 @@ def _get_hand_vertices(hand_dict, vi, is_left):
     beta = hand_dict['beta']
     global_orient = hand_dict['global_orient_camspace'][vi]
     hand_pose = hand_dict['hand_pose'][vi]
+    faces = mano_data['f'].astype(np.int64)
     S = np.diag([-1.0, 1.0, 1.0])
 
     if is_left:
@@ -121,6 +263,8 @@ def _get_hand_vertices(hand_dict, vi, is_left):
     else:
         verts = _mano_forward(mano_data, beta, global_orient, hand_pose, transl)
 
+    if recon_K is not None and image_shape is not None:
+        return _get_visible_hand_vertices(verts, faces, recon_K, image_shape)
     return verts
 
 # Datasets where video_decode_frame contains absolute frame indices
@@ -153,10 +297,23 @@ def _collect_surface_samples(depth_map, recon_K, points, half_patch=2):
     Works with any set of camera-space 3D points — joints (21) or mesh
     vertices (778).  Uses a small patch (5x5) per point for robustness.
 
+    IMPORTANT — intrinsics and camera space:
+      ``points`` are VITRA joints/vertices in camera space.  Camera-space 3D
+      coordinates are *intrinsics-independent* — they are physical metric
+      positions relative to the camera center.  A point at (0.3, 0.05, 0.5)
+      is at that position regardless of lens or image resolution.
+
+      To project a camera-space point to pixel coordinates, use the intrinsics
+      of the IMAGE you are projecting onto (here, the reconstruction depth map).
+      Do NOT reproject through annotation intrinsics — that would change the 3D
+      position and produce wrong pixel lookups.  Both VITRA and the
+      reconstruction backend (Pi3/TTT3R) view the same physical scene from the
+      same camera, so they share the same camera space.
+
     Args:
         depth_map: (H, W) depth array
-        recon_K: 3x3 reconstruction intrinsics
-        points: (N, 3) camera-space 3D points
+        recon_K: 3x3 intrinsics of the reconstruction (matches depth_map pixels)
+        points: (N, 3) camera-space 3D points (from VITRA joints or MANO verts)
         half_patch: half-size of sampling patch (default 2 → 5x5)
 
     Returns:
@@ -213,21 +370,27 @@ def _robust_median(arr):
     return float(np.median(filtered)), filtered
 
 
-def _collect_joint_offsets(depth_map, recon_K, joints, half_patch=5):
+def _collect_joint_offsets(depth_map, recon_K, joints, half_patch=5,
+                          metric_scale=1.0):
     """Project joints into depth map and collect z-offsets (depth - joint_z).
 
     Uses only the wrist (joint 0) and proximal joints (1, 5, 9, 13, 17) which
     are least likely to be occluded by a held object.  Fingertips and middle
     phalanges are often behind the object surface, biasing the offset.
 
+    Same intrinsics rule as _collect_surface_samples: project camera-space
+    joints using recon_K directly.  See that function's docstring for why
+    annotation intrinsics should NOT be used here.
+
     Args:
-        depth_map: (H, W) depth array (already in metric)
-        recon_K: 3x3 reconstruction intrinsics
-        joints: (21, 3) metric camera-space joints
+        depth_map: (H, W) RAW depth array (not yet metric-scaled)
+        recon_K: 3x3 intrinsics of the reconstruction (matches depth_map pixels)
+        joints: (21, 3) camera-space joints from VITRA (metric)
         half_patch: half-size of sampling patch
+        metric_scale: global scale factor (divide raw depth by this to get metric)
 
     Returns:
-        list of (depth_surface_z - joint_z) offsets for valid joints
+        list of (metric_depth_surface_z - joint_z) offsets for valid joints
     """
     H_d, W_d = depth_map.shape
     fx, fy = recon_K[0, 0], recon_K[1, 1]
@@ -258,7 +421,7 @@ def _collect_joint_offsets(depth_map, recon_K, joints, half_patch=5):
         if len(valid) == 0:
             continue
 
-        d_surface = float(np.median(valid))
+        d_surface = float(np.median(valid)) / metric_scale  # raw → metric
 
         # Tighter ratio filter: reject if surface depth differs >30% from
         # joint depth.  A held object in front of the hand typically causes
@@ -289,163 +452,77 @@ def _save_original_as_fallback(annotation_path, results_dir):
         print(f"  Saved original annotation as fallback: {corrected_path}")
 
 
-def _fix_metric_scale_if_needed(ttt3r_out, annotation_path, results_dir,
-                                marker_path):
-    """Check if a 'metric' depth is actually consistent with VITRA hand joints.
+def rescale_to_metric_scale(recon_dir, annotation_path, results_dir=None,
+                            correct_hand_positions=False,
+                            per_frame_scale=False,
+                            apply_scale=False):
+    """Compute the metric scale factor and correct hand positions.
 
-    Some backends (Pi3) claim metric scale but the depth can be off by 2-6x on
-    certain videos.  This function computes the depth/joint_z ratio across all
-    frames, and if the median ratio is outside [0.7, 1.3], applies a global
-    scale correction to depth maps and camera translations — just like Step 1
-    of the TTT3R rescaling — before per-frame hand correction runs.
-
-    Uses a wide ratio filter (0.1-10.0) since the whole point is to catch large
-    scale mismatches that the tight filter in _collect_joint_offsets would miss.
-    """
-    annotation = np.load(annotation_path, allow_pickle=True).item()
-    vdf = annotation.get("video_decode_frame")
-    if vdf is None:
-        return
-
-    vdf = _rebase_vdf(vdf, annotation_path)
-    frame_hands = _collect_frame_hands(annotation, vdf)
-    if not frame_hands:
-        return
-
-    depth_dir = os.path.join(ttt3r_out, "depth")
-    camera_dir = os.path.join(ttt3r_out, "camera")
-
-    # Collect depth/joint_z ratios with WIDE filter (0.1-20.0) to catch
-    # large mismatches that the standard filter would reject
-    all_ratios = []
-    for vf, hands_info in sorted(frame_hands.items()):
-        depth_path = os.path.join(depth_dir, f"{vf:06d}.npy")
-        cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
-        if not os.path.exists(depth_path) or not os.path.exists(cam_path):
-            continue
-        depth_map = np.load(depth_path)
-        recon_K = np.load(cam_path)["intrinsics"]
-        H_d, W_d = depth_map.shape
-        fx, fy = recon_K[0, 0], recon_K[1, 1]
-        cx, cy = recon_K[0, 2], recon_K[1, 2]
-        for _, _, joints in hands_info:
-            for j in range(21):
-                pt = joints[j]
-                if pt[2] <= 0.05:
-                    continue
-                u = int(round(fx * pt[0] / pt[2] + cx))
-                v = int(round(fy * pt[1] / pt[2] + cy))
-                if u < 2 or u >= W_d - 2 or v < 2 or v >= H_d - 2:
-                    continue
-                patch = depth_map[max(v-5,0):v+6, max(u-5,0):u+6]
-                valid = patch[(patch > 0) & np.isfinite(patch)]
-                if len(valid) == 0:
-                    continue
-                ratio = float(np.median(valid)) / pt[2]
-                if 0.1 <= ratio <= 20.0:
-                    all_ratios.append(ratio)
-
-    if len(all_ratios) < 5:
-        return
-
-    median_ratio = float(np.median(all_ratios))
-    if 0.7 <= median_ratio <= 1.3:
-        # Scale is already consistent, no global correction needed
-        return
-
-    # Apply global scale correction
-    print(f"  Metric scale correction: depth/VITRA ratio = {median_ratio:.3f}, "
-          f"rescaling depth maps by 1/{median_ratio:.3f}")
-
-    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
-    for dp in depth_files:
-        d = np.load(dp)
-        d = d / median_ratio
-        np.save(dp, d)
-
-    camera_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
-    for cp in camera_files:
-        cam = dict(np.load(cp))
-        pose = cam["pose"].copy()
-        pose[:3, 3] /= median_ratio
-        np.savez(cp, pose=pose, intrinsics=cam["intrinsics"])
-
-    print(f"  Rescaled {len(depth_files)} depth maps and "
-          f"{len(camera_files)} camera poses")
-
-    # Update marker to record the additional correction
-    with open(marker_path, "w") as f:
-        f.write(f"{median_ratio}")
-
-
-def rescale_ttt3r_to_metric(ttt3r_out, annotation_path, results_dir=None):
-    """Rescale depth maps and camera poses to metric in-place, and correct
-    hand joint positions to sit on the depth surface.
+    Non-destructive: depth and camera files are NOT overwritten.  The global
+    scale factor is saved to ``metric_scale.txt`` and applied on the fly by
+    readers via ``load_metric_scale()``.
 
     Two-step approach:
-      Step 1 — Global scale: single median ratio across all frames/joints,
-               applied to every depth map and camera translation.  Puts
-               everything in approximate metric (meters).
-      Step 2 — Per-frame hand correction: for frames with hand data, compute
-               a z-offset so the hand's joints align with the depth surface.
-               Offset is applied in **world space** to ``transl_worldspace``
-               and ``joints_worldspace`` (what training reads), plus
-               ``joints_camspace`` for consistency.  Corrected episode .npy
-               is saved to ``<results_dir>/corrected_annotations/<episode_id>.npy``.
+      Step 1 — Global scale: median ratio of raw_depth / MANO_vertex_z across
+               all frames, using back-face-culled MANO mesh vertices for dense
+               sampling.  Saved to ``<recon_dir>/metric_scale.txt``.
+      Step 2 — Per-frame hand correction: for each frame with hand data,
+               compute a z-offset that aligns the hand joints to the (metric-
+               scaled) depth surface.  The offset is applied in world space
+               to ``transl_worldspace`` and ``joints_worldspace``, plus
+               ``joints_camspace`` for consistency.  Corrected annotation is
+               saved to ``<results_dir>/corrected_annotations/<episode_id>.npy``.
 
     Args:
-        ttt3r_out: Path to intermediate_depth directory (depth/, camera/).
+        recon_dir: Path to reconstruction directory (depth/, camera/).
         annotation_path: Path to the VITRA episode .npy file.
         results_dir: Top-level results directory for this video.  If None,
-                     defaults to the parent of ttt3r_out.
+                     defaults to the parent of recon_dir.
 
     Returns:
         global_scale: the global scale factor, or None if rescaling was skipped.
     """
     if results_dir is None:
-        results_dir = os.path.dirname(ttt3r_out)
+        results_dir = os.path.dirname(recon_dir)
 
-    marker_path = os.path.join(ttt3r_out, ".metric_scale")
-    if os.path.exists(marker_path):
-        info = open(marker_path).read().strip()
-        print(f"  Already rescaled to metric ({info})")
+    scale_path = os.path.join(recon_dir, "metric_scale.txt")
 
+    # Skip if already computed
+    if os.path.exists(scale_path):
+        global_scale = load_metric_scale(recon_dir)
+        print(f"  Metric scale already computed: {global_scale:.6f}")
+
+        # Still need to run hand correction if not done yet
         episode_id = os.path.splitext(os.path.basename(annotation_path))[0]
         corrected_dir = os.path.join(results_dir, "corrected_annotations")
         corrected_path = os.path.join(corrected_dir, episode_id + ".npy")
+        if correct_hand_positions and not os.path.exists(corrected_path):
+            _correct_hand_positions(recon_dir, annotation_path, results_dir,
+                                    metric_scale=global_scale)
 
-        if not os.path.exists(corrected_path):
-            # Check if metric scale is actually consistent with VITRA hands.
-            # Some backends (Pi3) claim metric scale but can be off by 2-6x
-            # on certain videos.  If the depth/joint ratio is far from 1.0,
-            # apply a global correction before per-frame hand correction.
-            _fix_metric_scale_if_needed(
-                ttt3r_out, annotation_path, results_dir, marker_path)
-            _correct_hand_positions(ttt3r_out, annotation_path, results_dir)
-
-        return float(info.split(",")[0])
+        return global_scale
 
     annotation = np.load(annotation_path, allow_pickle=True).item()
     vdf = annotation.get("video_decode_frame")
     if vdf is None:
         print("  WARNING: No video_decode_frame in annotation, skipping rescale")
-        _save_original_as_fallback(annotation_path, results_dir)
         return None
 
     vdf = _rebase_vdf(vdf, annotation_path)
 
-    depth_dir = os.path.join(ttt3r_out, "depth")
-    camera_dir = os.path.join(ttt3r_out, "camera")
+    depth_dir = os.path.join(recon_dir, "depth")
+    camera_dir = os.path.join(recon_dir, "camera")
 
-    # ── Collect per-frame hand joint data ──────────────────────────────
+    # ── Collect per-frame hand data ───────────────────────────────────
     frame_hands = _collect_frame_hands(annotation, vdf)
 
     if not frame_hands:
         print("  WARNING: No valid hand frames, skipping rescale")
-        _save_original_as_fallback(annotation_path, results_dir)
         return None
 
-    # ── Step 1: Global scale ──────────────────────────────────────────
+    # ── Step 1: Global scale using MANO mesh vertices ─────────────────
+    # Uses back-face-culled MANO vertices (~450 per hand) for dense
+    # sampling.  Falls back to 21 joints if MANO model unavailable.
     all_samples = []
     for vf, hands_info in sorted(frame_hands.items()):
         depth_path = os.path.join(depth_dir, f"{vf:06d}.npy")
@@ -454,42 +531,88 @@ def rescale_ttt3r_to_metric(ttt3r_out, annotation_path, results_dir=None):
             continue
         depth_map = np.load(depth_path)
         recon_K = np.load(cam_path)["intrinsics"]
-        for _, _, joints in hands_info:
-            all_samples.extend(_collect_joint_samples(depth_map, recon_K, joints))
+        for hand_name, vi, joints in hands_info:
+            is_left = (hand_name == "left")
+            verts = _get_hand_vertices(
+                annotation[hand_name], vi, is_left,
+                recon_K=recon_K, image_shape=depth_map.shape)
+            if verts is None:
+                raise RuntimeError(
+                    f"MANO model not available for {'left' if is_left else 'right'} hand. "
+                    f"Expected at: {_MANO_LEFT_PATH if is_left else _MANO_RIGHT_PATH}")
+            all_samples.extend(
+                _collect_surface_samples(depth_map, recon_K, verts))
 
-    if len(all_samples) < 10:
-        print(f"  WARNING: Only {len(all_samples)} joint samples, skipping rescale")
-        _save_original_as_fallback(annotation_path, results_dir)
+    if len(all_samples) < 5:
+        print(f"  WARNING: Only {len(all_samples)} surface samples, skipping rescale")
         return None
 
     global_scale, filtered = _robust_median(np.array(all_samples))
     print(f"  Global scale: {global_scale:.6f} "
-          f"(median of {len(filtered)}/{len(all_samples)} samples, "
-          f"range [{filtered.min():.6f}, {filtered.max():.6f}])")
+          f"(median of {len(filtered)}/{len(all_samples)} samples)")
 
-    # Apply global scale to ALL depth maps and camera poses
-    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
-    for dp in depth_files:
-        d = np.load(dp)
-        d = d / global_scale
-        np.save(dp, d)
-
-    camera_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
-    for cp in camera_files:
-        cam = dict(np.load(cp))
-        pose = cam["pose"].copy()
-        pose[:3, 3] /= global_scale
-        np.savez(cp, pose=pose, intrinsics=cam["intrinsics"])
-
-    print(f"  Rescaled {len(depth_files)} depth maps and "
-          f"{len(camera_files)} camera poses to metric")
-
-    # Write marker
-    with open(marker_path, "w") as f:
+    # Save global scale
+    with open(scale_path, "w") as f:
         f.write(f"{global_scale}")
 
-    # ── Step 2: Per-frame hand position correction ────────────────────
-    _correct_hand_positions(ttt3r_out, annotation_path, results_dir)
+    # Optionally apply the scale to depth and camera files in-place
+    if apply_scale:
+        depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
+        for dp in depth_files:
+            d = np.load(dp)
+            np.save(dp, (d / global_scale).astype(np.float32))
+
+        camera_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
+        for cp in camera_files:
+            cam = dict(np.load(cp))
+            pose = cam["pose"].copy()
+            pose[:3, 3] /= global_scale
+            np.savez(cp, pose=pose, intrinsics=cam["intrinsics"])
+
+        # Scale is now baked in — set metric_scale.txt to 1.0 so readers
+        # don't double-apply
+        with open(scale_path, "w") as f:
+            f.write("1.0")
+
+        print(f"  Applied scale to {len(depth_files)} depth maps and "
+              f"{len(camera_files)} camera poses")
+
+    # Optionally compute per-frame scales for tighter alignment
+    if per_frame_scale:
+        import json as _json
+        per_frame_scales = {"global": global_scale}
+        for vf, hands_info in sorted(frame_hands.items()):
+            depth_path = os.path.join(depth_dir, f"{vf:06d}.npy")
+            cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
+            if not os.path.exists(depth_path) or not os.path.exists(cam_path):
+                continue
+            depth_map = np.load(depth_path)
+            recon_K = np.load(cam_path)["intrinsics"]
+            frame_samples = []
+            for hand_name, vi, joints in hands_info:
+                is_left = (hand_name == "left")
+                verts = _get_hand_vertices(
+                    annotation[hand_name], vi, is_left,
+                    recon_K=recon_K, image_shape=depth_map.shape)
+                if verts is None:
+                    raise RuntimeError(
+                        f"MANO model not available for {'left' if is_left else 'right'} hand. "
+                        f"Expected at: {_MANO_LEFT_PATH if is_left else _MANO_RIGHT_PATH}")
+                frame_samples.extend(
+                    _collect_surface_samples(depth_map, recon_K, verts))
+            if len(frame_samples) >= 3:
+                frame_scale, _ = _robust_median(np.array(frame_samples))
+                per_frame_scales[str(vf)] = round(frame_scale, 8)
+        pf_path = os.path.join(recon_dir, "metric_scale_per_frame.json")
+        with open(pf_path, "w") as f:
+            _json.dump(per_frame_scales, f, indent=2)
+        print(f"  Per-frame scales: {len(per_frame_scales)-1} frames "
+              f"(saved to metric_scale_per_frame.json)")
+
+    # ── Step 2: Per-frame hand position correction (optional) ──────────
+    if correct_hand_positions:
+        _correct_hand_positions(recon_dir, annotation_path, results_dir,
+                                metric_scale=global_scale)
 
     return global_scale
 
@@ -497,13 +620,24 @@ def rescale_ttt3r_to_metric(ttt3r_out, annotation_path, results_dir=None):
 def _collect_frame_hands(annotation, vdf):
     """Build mapping: video_frame_index -> list of (hand_name, vi, joints_camspace).
 
+    Frame indexing convention:
+      - ``vi`` = VITRA annotation index (0-based row into joints_camspace,
+        kept_frames, etc.).  This is the temporal index within the episode.
+      - ``vf`` = video frame index as stored in video_decode_frame.  For
+        datasets with absolute indices (Epic, Ego4D, EgoExo4D), vdf must be
+        rebased to clip-relative indices BEFORE calling this function (see
+        ``_rebase_vdf``).  After rebasing, vf == vi for contiguous clips,
+        but they can differ if frames were subsampled.
+      - Depth/color/camera files are named ``{vf:06d}.npy/.png/.npz``.
+
     Args:
         annotation: VITRA annotation dict
-        vdf: rebased video_decode_frame array
+        vdf: rebased video_decode_frame array (clip-relative frame indices)
 
     Returns:
-        dict: vf_int -> [(hand_name, vi, (21, 3) joints), ...]
+        dict: vf_int -> [(hand_name, vi, (21, 3) joints_camspace), ...]
               vi is the VITRA annotation index (row in joints_camspace)
+              vf_int is the clip-relative frame index (matches depth filenames)
     """
     frame_hands = {}
     for hand_name in ["right", "left"]:
@@ -526,14 +660,15 @@ def _collect_frame_hands(annotation, vdf):
     return frame_hands
 
 
-def _correct_hand_positions(ttt3r_out, annotation_path, results_dir):
+def _correct_hand_positions(recon_dir, annotation_path, results_dir,
+                            metric_scale=1.0):
     """Compute per-frame z-offsets to align hand joints with the depth surface,
     and save a corrected episode .npy that training can load directly.
 
     For each frame with valid hand data, projects the VITRA wrist/proximal
-    joints into the (already metric-scaled) depth map, computes the median
-    z-offset, then transforms that offset to **world space** and applies it
-    to ``transl_worldspace`` and ``joints_worldspace`` (the fields read by
+    joints into the depth map (applying metric_scale on-the-fly), computes the
+    median z-offset, then transforms that offset to **world space** and applies
+    it to ``transl_worldspace`` and ``joints_worldspace`` (the fields read by
     training).
 
     **Occlusion robustness**: Only wrist + MCP joints are used (held objects
@@ -544,6 +679,12 @@ def _correct_hand_positions(ttt3r_out, annotation_path, results_dir):
     Saves the corrected annotation to
     ``<results_dir>/corrected_annotations/<episode_id>.npy`` as a drop-in
     replacement for the original episode file.
+
+    Args:
+        recon_dir: Path to reconstruction directory (depth/, camera/).
+        annotation_path: Path to the VITRA episode .npy file.
+        results_dir: Top-level results directory for this video.
+        metric_scale: Global scale factor (raw depth / metric_scale = metric depth).
     """
     import copy
 
@@ -557,8 +698,8 @@ def _correct_hand_positions(ttt3r_out, annotation_path, results_dir):
     if not frame_hands:
         return
 
-    depth_dir = os.path.join(ttt3r_out, "depth")
-    camera_dir = os.path.join(ttt3r_out, "camera")
+    depth_dir = os.path.join(recon_dir, "depth")
+    camera_dir = os.path.join(recon_dir, "camera")
 
     # Deep-copy the annotation so we can modify fields in-place
     corrected_ann = copy.deepcopy(annotation)
@@ -578,7 +719,8 @@ def _correct_hand_positions(ttt3r_out, annotation_path, results_dir):
         recon_K = np.load(cam_path)["intrinsics"]
 
         for hand_name, vi, joints in hands_info:
-            offsets = _collect_joint_offsets(depth_map, recon_K, joints)
+            offsets = _collect_joint_offsets(depth_map, recon_K, joints,
+                                            metric_scale=metric_scale)
             if len(offsets) >= 2:
                 raw_offsets[(hand_name, vi)] = float(np.median(offsets))
             else:
@@ -659,71 +801,10 @@ def _correct_hand_positions(ttt3r_out, annotation_path, results_dir):
     print(f"  Saved corrected annotation: {corrected_path}")
 
 
-def rescale_depth_maps_only(ttt3r_out, annotation_path):
-    """Compute global scale from hand joints and rescale depth maps + camera
-    poses in-place.  Does NOT modify the annotation.
 
-    Returns the global_scale factor, or None if rescaling was skipped.
-    """
-    annotation = np.load(annotation_path, allow_pickle=True).item()
-    vdf = annotation.get("video_decode_frame")
-    if vdf is None:
-        return None
-
-    vdf = _rebase_vdf(vdf, annotation_path)
-    depth_dir = os.path.join(ttt3r_out, "depth")
-    camera_dir = os.path.join(ttt3r_out, "camera")
-    frame_hands = _collect_frame_hands(annotation, vdf)
-    if not frame_hands:
-        return None
-
-    all_samples = []
-    for vf, hands_info in sorted(frame_hands.items()):
-        depth_path = os.path.join(depth_dir, f"{vf:06d}.npy")
-        cam_path = os.path.join(camera_dir, f"{vf:06d}.npz")
-        if not os.path.exists(depth_path) or not os.path.exists(cam_path):
-            continue
-        depth_map = np.load(depth_path)
-        recon_K = np.load(cam_path)["intrinsics"]
-        for hand_name, vi, joints in hands_info:
-            # Use full MANO mesh surface (778 vertices) for dense sampling
-            is_left = (hand_name == "left")
-            verts = _get_hand_vertices(annotation[hand_name], vi, is_left)
-            if verts is not None:
-                all_samples.extend(
-                    _collect_surface_samples(depth_map, recon_K, verts))
-            else:
-                # Fall back to 21 joints if MANO model not available
-                all_samples.extend(
-                    _collect_surface_samples(depth_map, recon_K, joints))
-
-    if len(all_samples) < 5:
-        print(f"  WARNING: Only {len(all_samples)} surface samples, skipping rescale")
-        return 1.0
-
-    global_scale, filtered = _robust_median(np.array(all_samples))
-    print(f"  Global scale: {global_scale:.6f} "
-          f"(median of {len(filtered)}/{len(all_samples)} samples)")
-
-    # Rescale depth maps
-    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
-    for dp in depth_files:
-        d = np.load(dp)
-        d = d / global_scale
-        np.save(dp, d)
-
-    # Rescale camera translations
-    camera_files = sorted(glob.glob(os.path.join(camera_dir, "*.npz")))
-    for cp in camera_files:
-        cam = dict(np.load(cp))
-        pose = cam["pose"].copy()
-        pose[:3, 3] /= global_scale
-        np.savez(cp, pose=pose, intrinsics=cam["intrinsics"])
-
-    print(f"  Rescaled {len(depth_files)} depth maps and "
-          f"{len(camera_files)} camera poses")
-
-    return global_scale
+# rescale_depth_maps_only was removed — use rescale_to_metric_scale instead,
+# which computes the same scale but saves it to metric_scale.txt without
+# overwriting depth/camera files (non-destructive).
 
 
 def rescale_annotation_camspace(annotation_path, global_scale, results_dir):

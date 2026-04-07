@@ -160,8 +160,14 @@ const controls = new TrackballControls(camera, canvas);
 controls.rotateSpeed = 3.0;
 controls.zoomSpeed = 1.5;
 controls.panSpeed = 1.0;
+controls.noPan = false;
+controls.noRotate = false;
+controls.noZoom = false;
 controls.dynamicDampingFactor = 0.15;
 controls.staticMoving = false;
+
+// Prevent context menu on right-click so panning works
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
 const plyLoader = new PLYLoader();
 
@@ -292,10 +298,11 @@ async function loadFrame(idx) {
 
   const frame = currentVideo.frames[idx];
   const videoId = currentVideo.video_id;
+  const reconDir = currentVideo.recon_dir || 'intermediate_depth';
 
   // Load image
   if (frame.color) {
-    frameImage.src = `/data/${videoId}/intermediate_depth/color/${frame.color}`;
+    frameImage.src = `/data/${videoId}/${reconDir}/color/${frame.color}`;
   }
 
   // Show/hide indicator labels
@@ -304,6 +311,7 @@ async function loadFrame(idx) {
   // Adjust recon label position based on whether hand label is visible
   reconLabel.style.top = frame.has_hand ? '36px' : '8px';
 
+
   // Load PLY
   const cacheKey = `${videoId}/${frame.ply}`;
   if (plyCache.has(cacheKey)) {
@@ -311,7 +319,7 @@ async function loadFrame(idx) {
   } else {
     loadingIndicator.style.display = 'inline';
     try {
-      const geometry = await loadPLY(`/data/${videoId}/depth/${frame.ply}`);
+      const geometry = await loadPLY(`/data/${videoId}/${reconDir}/depth/${frame.ply}`);
       plyCache.set(cacheKey, geometry);
       // Only show if we're still on the same frame
       if (currentFrameIdx === idx) {

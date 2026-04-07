@@ -27,10 +27,59 @@ import struct
 import sys
 import webbrowser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
+import trimesh
+
+from rescale_to_metric import load_metric_scale, _get_hand_vertices
+from visualize_hand_overlay import (
+    load_mano_model, generate_hand_points,
+    MANO_RIGHT_PATH, MANO_LEFT_PATH, _rebase_vdf,
+)
+
+
+def _find_episode_dirs(results_dir):
+    """Find all episode directories, handling both flat and nested layouts.
+
+    Supports:
+      - Flat: results_dir/episode_id/reconstruction/...
+      - Nested: results_dir/dataset/episode_id/reconstruction/...
+      - Legacy: results_dir/episode_id/intermediate_depth/...
+
+    Returns list of (display_name, video_dir, recon_dir) tuples.
+    """
+    found = []
+    results_dir = os.path.abspath(results_dir)
+
+    for entry in sorted(os.listdir(results_dir)):
+        entry_path = os.path.join(results_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        # Check if this entry is an episode dir (has reconstruction/ or intermediate_depth/)
+        recon_dir = os.path.join(entry_path, "reconstruction")
+        if not os.path.isdir(recon_dir):
+            recon_dir = os.path.join(entry_path, "intermediate_depth")
+        if os.path.isdir(recon_dir):
+            found.append((entry, entry_path, recon_dir))
+            continue
+
+        # Otherwise check if it's a dataset subdir (e.g. epic/, ssv2/)
+        for sub in sorted(os.listdir(entry_path)):
+            sub_path = os.path.join(entry_path, sub)
+            if not os.path.isdir(sub_path):
+                continue
+            recon_dir = os.path.join(sub_path, "reconstruction")
+            if not os.path.isdir(recon_dir):
+                recon_dir = os.path.join(sub_path, "intermediate_depth")
+            if os.path.isdir(recon_dir):
+                # Display as dataset/episode for clarity
+                display = f"{entry}/{sub}"
+                found.append((display, sub_path, recon_dir))
+
+    return found
 
 
 def scan_results(results_dir):
@@ -38,14 +87,10 @@ def scan_results(results_dir):
     results_dir = os.path.abspath(results_dir)
     videos = {}
 
-    for entry in sorted(os.listdir(results_dir)):
-        video_dir = os.path.join(results_dir, entry)
-        if not os.path.isdir(video_dir):
-            continue
-
-        depth_dir = os.path.join(video_dir, "depth")
-        color_dir = os.path.join(video_dir, "intermediate_depth", "color")
-        camera_dir = os.path.join(video_dir, "intermediate_depth", "camera")
+    for entry, video_dir, recon_dir in _find_episode_dirs(results_dir):
+        depth_dir = os.path.join(recon_dir, "depth")
+        color_dir = os.path.join(recon_dir, "color")
+        camera_dir = os.path.join(recon_dir, "camera")
         seg_dir = os.path.join(video_dir, "scene_segmentation")
 
         if not os.path.isdir(depth_dir) or not os.path.isdir(color_dir):
@@ -57,14 +102,18 @@ def scan_results(results_dir):
         if not depth_npy_files:
             continue
 
-        # Get action text from manifest if available
+        # Get action text from manifest if available.
+        # entry may be "epic/kitchens_P01_01_ep_000000" (nested) or just
+        # "kitchens_P01_01_ep_000000" (flat). Match against both.
         action_text = entry
+        episode_basename = os.path.basename(entry)
         manifest_path = os.path.join(results_dir, "manifest.json")
         if os.path.exists(manifest_path):
             with open(manifest_path) as f:
                 manifest = json.load(f)
             for item in manifest:
-                if item.get("video_name") == entry:
+                vn = item.get("video_name", "")
+                if vn == entry or vn == episode_basename:
                     action_text = item.get("action_text", entry)
                     break
 
@@ -82,30 +131,40 @@ def scan_results(results_dir):
                     idx = int(fname.replace("frame_", "").replace(".ply", ""))
                     recon_frame_indices.add(idx)
 
-        # Scan VITRA annotations for frames with hand models
+        # Scan for VITRA annotations — prefer corrected_annotations/ in the
+        # output dir (dataset-agnostic), fall back to original annotation from
+        # the manifest.  The old code hardcoded SSv2 annotation paths, which
+        # meant Epic Kitchen / Ego4D clips never got has_hand=True.
+        #
+        # hand_frame_indices uses annotation index ``vi`` (0-based), which
+        # matches depth frame basenames (000000, 000001, ...) after vdf
+        # rebasing.  We do NOT use raw vdf values here — those are absolute
+        # source-video frame indices for Epic/Ego4D.
         hand_frame_indices = set()
-        vitra_candidates = [
-            os.path.join(os.path.dirname(os.path.dirname(results_dir)),
-                         "vitra_data", "ssv2", "episodic_annotations"),
-            os.path.join(os.path.dirname(results_dir),
-                         "vitra_data", "ssv2", "episodic_annotations"),
-        ]
-        vitra_pattern = None
-        for vd in vitra_candidates:
-            vp = os.path.join(vd, f"somethingsomethingv2_{entry}_ep_000000.npy")
-            if os.path.exists(vp):
-                vitra_pattern = vp
-                break
-        if vitra_pattern is not None:
+        annotation_path = None
+        corrected_dir = os.path.join(video_dir, "corrected_annotations")
+        if os.path.isdir(corrected_dir):
+            npy_files = [f for f in os.listdir(corrected_dir) if f.endswith(".npy")]
+            if npy_files:
+                annotation_path = os.path.join(corrected_dir, npy_files[0])
+        if annotation_path is None and os.path.exists(manifest_path):
+            # Try annotation_path from manifest
+            for item in manifest:
+                if item.get("video_name") == entry:
+                    ap = item.get("annotation_path")
+                    if ap and os.path.exists(ap):
+                        annotation_path = ap
+                    break
+        if annotation_path is not None:
             try:
-                ann = np.load(vitra_pattern, allow_pickle=True).item()
-                vdf = ann.get("video_decode_frame", np.array([]))
+                ann = np.load(annotation_path, allow_pickle=True).item()
+                n_frames = len(ann.get("video_decode_frame", []))
                 for hand_key in ["left", "right"]:
                     if hand_key in ann:
                         kept = ann[hand_key].get("kept_frames", np.array([]))
-                        for vi, vf in enumerate(vdf):
-                            if vi < len(kept) and kept[vi]:
-                                hand_frame_indices.add(int(vf))
+                        for vi in range(min(n_frames, len(kept))):
+                            if kept[vi]:
+                                hand_frame_indices.add(vi)
             except Exception:
                 pass
 
@@ -117,13 +176,18 @@ def scan_results(results_dir):
                 if os.path.splitext(cf)[0] == bn:
                     color_file = cf
                     break
-            # Load camera pose (c2w 4x4 matrix) if available
+            # Load camera pose (c2w 4x4 matrix) and apply metric scale
+            # to the translation so it matches the scaled point cloud
             pose = None
             camera_path = os.path.join(camera_dir, bn + ".npz")
             if os.path.exists(camera_path):
                 cam_data = np.load(camera_path)
                 if "pose" in cam_data:
-                    pose = cam_data["pose"].astype(float).tolist()
+                    p = cam_data["pose"].astype(float).copy()
+                    frame_scale = load_metric_scale(recon_dir,
+                                                    frame_idx=int(bn))
+                    p[:3, 3] /= frame_scale
+                    pose = p.tolist()
             frames.append({
                 "basename": bn,
                 "ply": bn + ".ply",  # virtual — generated on-the-fly from .npy
@@ -133,9 +197,13 @@ def scan_results(results_dir):
                 "has_hand": int(bn) in hand_frame_indices,
             })
 
+        # Reconstruction subdir name (reconstruction/ or intermediate_depth/)
+        recon_subdir = os.path.basename(recon_dir)
+
         videos[entry] = {
             "video_id": entry,
             "action_text": action_text,
+            "recon_dir": recon_subdir,
             "num_frames": len(frames),
             "num_color_frames": len(color_files),
             "frames": frames,
@@ -143,6 +211,64 @@ def scan_results(results_dir):
         }
 
     return videos
+
+
+# ── MANO models (loaded once on first use) ──
+_mano_r = None
+_mano_l = None
+_mano_loaded = False
+
+def _ensure_mano():
+    global _mano_r, _mano_l, _mano_loaded
+    if _mano_loaded:
+        return
+    _mano_r = load_mano_model(MANO_RIGHT_PATH)
+    _mano_l = load_mano_model(MANO_LEFT_PATH)
+    _mano_loaded = True
+
+# Cache: video_name -> (annotation_dict, annotation_path)
+_annotation_cache = {}
+
+def _get_annotation(results_dir, video_name):
+    """Load and cache the corrected (or original) annotation for a video.
+
+    video_name may be nested (e.g. "epic/kitchens_P01_01_ep_000000") or
+    flat (e.g. "kitchens_P01_01_ep_000000").
+    """
+    if video_name in _annotation_cache:
+        return _annotation_cache[video_name]
+
+    video_dir = os.path.join(results_dir, video_name)
+    episode_basename = os.path.basename(video_name)
+    ann_path = None
+
+    # Check corrected_annotations/ in the video dir
+    corrected_dir = os.path.join(video_dir, "corrected_annotations")
+    if os.path.isdir(corrected_dir):
+        npy_files = [f for f in os.listdir(corrected_dir) if f.endswith(".npy")]
+        if npy_files:
+            ann_path = os.path.join(corrected_dir, npy_files[0])
+
+    if ann_path is None:
+        # Try manifest (match on full name or basename)
+        manifest_path = os.path.join(results_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            with open(manifest_path) as f:
+                for item in json.load(f):
+                    vn = item.get("video_name", "")
+                    if vn == video_name or vn == episode_basename:
+                        ap = item.get("annotation_path")
+                        if ap and os.path.exists(ap):
+                            ann_path = ap
+                        break
+
+    if ann_path is None:
+        _annotation_cache[video_name] = (None, None)
+        return None, None
+
+    ann = np.load(ann_path, allow_pickle=True).item()
+    _annotation_cache[video_name] = (ann, ann_path)
+    return ann, ann_path
 
 
 class ViewerHandler(http.server.BaseHTTPRequestHandler):
@@ -231,33 +357,45 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
           - <video>/intermediate_depth/camera/000001.npz  (intrinsics + pose)
           - <video>/intermediate_depth/color/000001.png    (color image)
         and returns binary PLY bytes.
+
+        If a VITRA annotation is available, MANO hand surface points are
+        generated live and appended as colored points (green) to the scene.
         """
         basename = os.path.splitext(os.path.basename(ply_path))[0]
         depth_dir = os.path.dirname(ply_path)
-        video_dir = os.path.dirname(depth_dir)
+        # depth_dir is <video>/reconstruction/depth/ (or <video>/intermediate_depth/depth/)
+        # recon_dir is one level up from depth_dir
+        recon_dir = os.path.dirname(depth_dir)
+        video_dir = os.path.dirname(recon_dir)
 
         npy_path = os.path.join(depth_dir, basename + ".npy")
         if not os.path.isfile(npy_path):
             return None
 
-        cam_path = os.path.join(video_dir, "intermediate_depth", "camera", basename + ".npz")
+        cam_path = os.path.join(recon_dir, "camera", basename + ".npz")
         if not os.path.isfile(cam_path):
             return None
 
         depth = np.load(npy_path)
         cam = np.load(cam_path)
         intrinsics = cam["intrinsics"]
-        pose_c2w = cam["pose"]
+        pose_c2w = cam["pose"].copy()
+
+        # Apply metric scale (non-destructive — raw depth on disk).
+        # Uses per-frame scale if available, else global scale.
+        frame_idx = int(basename)
+        metric_scale = load_metric_scale(recon_dir, frame_idx=frame_idx)
+        depth = depth / metric_scale
+        pose_c2w[:3, 3] = pose_c2w[:3, 3] / metric_scale
 
         # Load color image
         color = None
         for ext in (".png", ".jpg"):
-            color_path = os.path.join(video_dir, "intermediate_depth", "color", basename + ext)
+            color_path = os.path.join(recon_dir, "color", basename + ext)
             if os.path.isfile(color_path):
                 color = cv2.imread(color_path)
                 if color is not None:
                     color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-                    # Resize color to match depth if needed
                     if color.shape[:2] != depth.shape[:2]:
                         color = cv2.resize(color, (depth.shape[1], depth.shape[0]))
                 break
@@ -294,8 +432,73 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         if color is not None:
             colors = color[valid]
         else:
-            # Gray fallback
             colors = np.full((len(pts_world), 3), 180, dtype=np.uint8)
+
+        # ── Add MANO hand points from VITRA annotation ──
+        #
+        # generate_hand_points() returns camera-space 3D points (from the MANO
+        # mesh surface).  These are in the same camera space as the depth map's
+        # unprojected points above — no intrinsics reprojection is needed.
+        # Camera-space coordinates are intrinsics-independent: they represent
+        # physical metric positions relative to the camera center.
+        #
+        # Frame indexing: depth files are named 000000..N (clip-relative).
+        # For Epic/Ego4D, vdf contains absolute source-video frame indices
+        # which must be rebased (subtract vdf[0]) to match clip-relative
+        # depth filenames.  The annotation index ``vi`` (row in joints_camspace)
+        # maps to rebased vdf[vi].
+        # Use relative path from results_dir to handle nested layouts
+        # (e.g. epic/kitchens_P01_01_ep_000000)
+        video_rel = os.path.relpath(video_dir, self.results_dir)
+        ann, ann_path = _get_annotation(self.results_dir, video_rel)
+        if ann is not None:
+            _ensure_mano()
+            frame_idx = int(basename)
+
+            # Map depth frame index → annotation index (vi)
+            vdf = ann.get("video_decode_frame")
+            if vdf is not None:
+                rebased = _rebase_vdf(np.asarray(vdf), ann_path)
+                vi = None
+                for i, vf in enumerate(rebased):
+                    if int(vf) == frame_idx:
+                        vi = i
+                        break
+            else:
+                vi = frame_idx
+
+            if vi is not None:
+                for hand_name in ["left", "right"]:
+                    if hand_name not in ann:
+                        continue
+                    is_left = (hand_name == "left")
+
+                    # Visible surface (red) — sampled from visibility-tested faces
+                    vis_pts = generate_hand_points(
+                        _mano_r, _mano_l, ann[hand_name], vi,
+                        is_left=is_left, num_samples=5000,
+                        recon_K=intrinsics, image_shape=depth.shape)
+
+                    # Full surface (green) — includes occluded parts
+                    all_pts = generate_hand_points(
+                        _mano_r, _mano_l, ann[hand_name], vi,
+                        is_left=is_left, num_samples=5000)
+
+                    if all_pts is not None:
+                        all_world = (R @ all_pts.T).T + t
+                        all_colors = np.tile(
+                            np.array([0, 255, 0], dtype=np.uint8),
+                            (len(all_world), 1))
+                        pts_world = np.vstack([pts_world, all_world])
+                        colors = np.vstack([colors, all_colors])
+
+                    if vis_pts is not None:
+                        vis_world = (R @ vis_pts.T).T + t
+                        vis_colors = np.tile(
+                            np.array([255, 0, 0], dtype=np.uint8),
+                            (len(vis_world), 1))
+                        pts_world = np.vstack([pts_world, vis_world])
+                        colors = np.vstack([colors, vis_colors])
 
         # Build binary PLY
         n = len(pts_world)
@@ -315,7 +518,6 @@ class ViewerHandler(http.server.BaseHTTPRequestHandler):
         buf.write(header.encode("ascii"))
         pts_f32 = pts_world.astype(np.float32)
         colors_u8 = colors.astype(np.uint8)
-        # Interleave: x,y,z (12 bytes) + r,g,b (3 bytes) per vertex
         vertex_data = np.empty(n, dtype=[
             ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
             ('r', 'u1'), ('g', 'u1'), ('b', 'u1'),

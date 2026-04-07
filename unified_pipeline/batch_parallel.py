@@ -66,20 +66,28 @@ def _extract_video_name(annotation_path):
     Returns (video_name, episode_id) where:
       - video_name: the source video identifier (e.g. "12345" for SSv2, "P01_01" for Epic)
       - episode_id: unique episode identifier used for output directory naming
+
+    Episode ID naming convention — keeps a short dataset prefix:
+      epic_kitchens_P01_01_ep_000000  → kitchens_P01_01_ep_000000
+      somethingsomethingv2_84562_ep_000000 → ssv2_84562_ep_000000
+      EgoExo4D_xxx_ep_000000 → egoexo4d_xxx_ep_000000
+      Ego4D_xxx_ep_000000 → ego4d_xxx_ep_000000
     """
     import re
     basename = os.path.splitext(os.path.basename(annotation_path))[0]
     dataset, prefix = _detect_dataset(annotation_path)
 
-    # Strip dataset prefix
+    # Strip dataset prefix to get body (video + episode)
     body = basename[len(prefix):] if prefix else basename
 
     # Strip _ep_NNNNNN suffix to get video name
     m = re.match(r"^(.+)_ep_\d+$", body)
     video_name = m.group(1) if m else body
 
-    # Episode ID is the full body (without dataset prefix)
-    episode_id = body
+    # Episode ID: strip the first token from the annotation filename.
+    # e.g. epic_kitchens_P01_01_ep_000000 → kitchens_P01_01_ep_000000
+    #      somethingsomethingv2_100000_ep_000000 → 100000_ep_000000
+    episode_id = basename.split("_", 1)[1] if "_" in basename else basename
 
     return video_name, episode_id
 
@@ -110,6 +118,20 @@ def _resolve_epic_video(video_name, annotation, epic_video_dir, output_dir):
 
     Epic-Kitchens annotations reference a subclip of a long source video.
     We extract the clip to output_dir/clips/ using ffmpeg.
+
+    IMPORTANT — frame-accurate extraction:
+      Time-based seeking (``-ss``) is NOT frame-accurate — it seeks to the
+      nearest keyframe, which can be off by several frames.  This causes a
+      frame offset between the extracted clip and the VITRA annotation's
+      video_decode_frame indices, making hand projections land on the wrong
+      frame.
+
+      Instead, we use ffmpeg's ``select`` filter with exact frame numbers.
+      VITRA's vdf uses 1-based frame indices while ffmpeg's ``n`` is 0-based,
+      so we add 1 to the start/end frame numbers.
+
+      This is NOT an issue for SSv2 because SSv2 videos are short standalone
+      clips — no extraction needed, and vdf is already clip-relative.
     """
     if not epic_video_dir:
         return None
@@ -134,27 +156,33 @@ def _resolve_epic_video(video_name, annotation, epic_video_dir, output_dir):
     if vdf is None:
         return None
 
-    fps = 60.0  # Epic-Kitchens
+    # Frame-accurate extraction using OpenCV.
+    # Both vdf and OpenCV's CAP_PROP_POS_FRAMES are 0-based.
+    import cv2
+
     start_frame = int(vdf[0])
     num_frames = len(vdf)
-    total_seconds = start_frame / fps
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    seconds = total_seconds % 60
-    start_time = f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", start_time,
-        "-i", source_path,
-        "-frames:v", str(num_frames),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        clip_path,
-    ]
+    cap = cv2.VideoCapture(source_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  WARNING: ffmpeg clip extraction failed: {result.stderr[:200]}")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(clip_path, fourcc, fps, (width, height))
+
+    for _ in range(num_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        writer.write(frame)
+
+    writer.release()
+    cap.release()
+
+    if not os.path.exists(clip_path):
+        print(f"  WARNING: Clip extraction failed for {video_name}")
         return None
 
     return clip_path
@@ -235,6 +263,7 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
             "video_path": video_path,
             "annotation_path": annot_path,
             "video_name": episode_id,
+            "dataset": dataset,
             "action_text": action_text,
         })
 
@@ -268,10 +297,22 @@ def main():
                         help="Scene reconstruction method (default: from JSON or ttt3r)")
     parser.add_argument("--frame_interval", type=int, default=1)
     parser.add_argument("--skip_reconstruction", action="store_true")
-    parser.add_argument("--skip_scene_seg", action="store_true")
-    parser.add_argument("--skip_sam3d", action="store_true")
-    parser.add_argument("--skip_combine", action="store_true")
+    # SAM3D, scene segmentation, and combine are OFF by default.
+    # The default pipeline is: reconstruction + metric rescaling only.
+    # Use --run_sam3d / --run_scene_seg / --run_combine to enable.
+    parser.add_argument("--run_scene_seg", action="store_true",
+                        help="Enable scene segmentation (off by default)")
+    parser.add_argument("--run_sam3d", action="store_true",
+                        help="Enable SAM3D object detection (off by default)")
+    parser.add_argument("--run_combine", action="store_true",
+                        help="Enable combine step (off by default)")
     parser.add_argument("--skip_visualizations", action="store_true")
+    parser.add_argument("--apply_scale", action="store_true",
+                        help="Apply metric scale to depth/camera files in-place "
+                             "(destructive — overwrites raw Pi3 output)")
+    parser.add_argument("--create_filtered_index", action="store_true",
+                        help="Create filtered episode_frame_index.npz for training "
+                             "(only includes episodes in this batch)")
 
     # Conda envs
     parser.add_argument("--ttt3r_env", type=str, default="ttt3r")
@@ -353,11 +394,15 @@ def main():
         json.dump(episodes, f, indent=2, default=str)
 
     # Build batch worker manifest
+    # Output structure: {output_dir}/{dataset}/{episode_id}/
+    # This matches the training code's expectation:
+    #   {precomputed_depth_root}/{depth_dataset_name}/{episode_id}/depth/
     batch_manifest = []
     for ep in episodes:
         batch_manifest.append({
             "video_path": ep["video_path"],
-            "output_dir": os.path.join(args.output_dir, ep["video_name"]),
+            "output_dir": os.path.join(args.output_dir, ep["dataset"],
+                                       ep["video_name"]),
             "annotation_path": ep.get("annotation_path"),
         })
     batch_manifest_path = os.path.join(args.output_dir, "batch_manifest.json")
@@ -374,9 +419,12 @@ def main():
         pi3_env=args.pi3_env, recon_method=recon_method,
         frame_interval=args.frame_interval,
         skip_reconstruction=args.skip_reconstruction,
-        skip_scene_seg=args.skip_scene_seg,
-        skip_sam3d=args.skip_sam3d, skip_combine=args.skip_combine,
+        skip_scene_seg=not args.run_scene_seg,
+        skip_sam3d=not args.run_sam3d,
+        skip_combine=not args.run_combine,
         skip_visualizations=args.skip_visualizations,
+        apply_scale=args.apply_scale,
+        create_filtered_index=args.create_filtered_index,
     )
     batch_elapsed = time.time() - batch_start
 
@@ -394,7 +442,8 @@ def main():
             "action_text": ep.get("action_text", ""),
             "returncode": 0 if success else 1,
             "elapsed_seconds": round(elapsed, 1),
-            "output_dir": os.path.join(args.output_dir, ep["video_name"]),
+            "output_dir": os.path.join(args.output_dir, ep["dataset"],
+                                       ep["video_name"]),
         })
 
     # Summary
@@ -431,6 +480,12 @@ def main():
     with open(results_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"Results:        {results_path}")
+
+    # Clean up clips (only needed during processing for Epic Kitchens)
+    import shutil
+    clips_dir = os.path.join(args.output_dir, "clips")
+    if os.path.isdir(clips_dir):
+        shutil.rmtree(clips_dir)
 
     sys.exit(0 if n_ok == len(results) else 1)
 

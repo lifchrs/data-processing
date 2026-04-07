@@ -76,8 +76,17 @@ def _rebase_vdf(vdf, annotation_path):
     """Rebase video_decode_frame to clip-relative indices if needed.
 
     For datasets like Epic-Kitchens, vdf contains absolute frame indices from
-    the full source video (e.g., 84849).  When we process a pre-extracted clip,
-    these must be rebased to start from 0.
+    the full source video (e.g., frame 5429 of P02_01.MP4).  When we process
+    a pre-extracted clip, the depth/color/camera files are numbered 000000,
+    000001, ..., so vdf must be rebased to start from 0.
+
+    After rebasing:
+      - vdf[vi] gives the clip-relative frame index (depth filename)
+      - vi is the annotation index (row in joints_camspace, kept_frames, etc.)
+      - For contiguous clips, vdf[vi] == vi
+
+    SSv2 videos are NOT rebased because vdf is already clip-relative (the
+    annotation covers the entire short video, not a subclip).
     """
     dataset = _detect_dataset(annotation_path)
     if dataset in _ABSOLUTE_VDF_DATASETS:
@@ -269,7 +278,7 @@ def run_ttt3r_batch(manifest, model_path, img_size, device, frame_interval,
 # ---------------------------------------------------------------------------
 
 def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
-                  intrinsics_root=None):
+                  intrinsics_root=None, apply_scale=False):
     """Load Pi3 model once and process all videos.
 
     For each video:
@@ -312,7 +321,7 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
         video_path = entry["video_path"]
         output_dir = entry["output_dir"]
         annotation_path = entry.get("annotation_path")
-        pi3_out = os.path.join(output_dir, "intermediate_depth")
+        pi3_out = os.path.join(output_dir, "reconstruction")
         os.makedirs(pi3_out, exist_ok=True)
 
         print(f"\n[{i+1}/{len(manifest)}] Processing: {os.path.basename(output_dir)}")
@@ -337,7 +346,8 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
             depth_dir = os.path.join(pi3_out, "depth")
             color_dir = os.path.join(pi3_out, "color")
             camera_dir = os.path.join(pi3_out, "camera")
-            for d in [depth_dir, color_dir, camera_dir]:
+            conf_dir = os.path.join(pi3_out, "conf")
+            for d in [depth_dir, color_dir, camera_dir, conf_dir]:
                 os.makedirs(d, exist_ok=True)
 
             # Load frames
@@ -405,6 +415,11 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                          pose=camera_poses[fi].astype(np.float64),
                          intrinsics=K.astype(np.float64))
 
+                # Confidence map (sigmoid of raw logits, quantized to 0-255)
+                c = 1.0 / (1.0 + np.exp(-conf[fi, :, :, 0]))
+                np.save(os.path.join(conf_dir, f"{basename}.npy"),
+                        np.clip(c * 255, 0, 255).astype(np.uint8))
+
                 if fi < len(orig_frames):
                     color = orig_frames[fi]
                     if color.shape[0] != H or color.shape[1] != W:
@@ -414,13 +429,89 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
 
             print(f"  Pi3 done in {time.time() - t_start:.1f}s ({N} frames)")
 
-            # --- Step 2: Metric rescaling ---
+            # --- Step 2: Metric rescaling + hand correction ---
             # Pi3's depth scale can be off by 2-7x. Use VITRA's MANO hand
             # annotations as a metric ruler to rescale depth maps + camera
-            # translations to true metric.
+            # translations to true metric, then apply per-frame hand z-offset
+            # correction and save corrected annotation.
             if annotation_path and os.path.exists(annotation_path):
-                from rescale_to_metric import rescale_depth_maps_only
-                rescale_depth_maps_only(pi3_out, annotation_path)
+                from rescale_to_metric import rescale_to_metric_scale
+                rescale_to_metric_scale(pi3_out, annotation_path,
+                                        results_dir=output_dir,
+                                        apply_scale=apply_scale)
+
+            # --- Step 3: Filter margin frames + occlusion culling ---
+            # Remove frames outside the VITRA annotation range (margin frames
+            # added during clipping for reconstruction context but not needed
+            # in output).  Then cull occluded points from depth maps.
+            import glob as _glob
+            from generate_combined_ply import remove_occluded_points
+
+            if annotation_path and os.path.exists(annotation_path):
+                annot = np.load(annotation_path, allow_pickle=True).item()
+                vdf_raw = annot.get('video_decode_frame')
+                if vdf_raw is not None:
+                    rebased = _rebase_vdf(np.asarray(vdf_raw), annotation_path)
+                    vdf_set = set(int(v) for v in rebased)
+                    for subdir in ["depth", "color", "camera"]:
+                        d = os.path.join(pi3_out, subdir)
+                        if not os.path.isdir(d):
+                            continue
+                        for fp in _glob.glob(os.path.join(d, "*")):
+                            bn = os.path.splitext(os.path.basename(fp))[0]
+                            if int(bn) not in vdf_set:
+                                os.remove(fp)
+                    n_kept = len(vdf_set)
+                    print(f"  Filtered to {n_kept} annotated frames "
+                          f"(removed margin frames)")
+
+            # Occlusion culling: zero out depth pixels behind closer surfaces.
+            # This is purely geometric — works on raw (unscaled) depth since
+            # all points are in the same consistent scale.
+            depth_files_post = sorted(
+                _glob.glob(os.path.join(depth_dir, "*.npy")))
+            n_culled_total = 0
+            for dp in depth_files_post:
+                bn = os.path.splitext(os.path.basename(dp))[0]
+                cp = os.path.join(camera_dir, f"{bn}.npz")
+                if not os.path.exists(cp):
+                    continue
+                depth_map = np.load(dp)
+                cam_data = np.load(cp)
+                pose_c2w = cam_data["pose"]
+                intr = cam_data["intrinsics"]
+                Hd, Wd = depth_map.shape
+                fx_d, fy_d = intr[0, 0], intr[1, 1]
+                cx_d, cy_d = intr[0, 2], intr[1, 2]
+                yg, xg = np.meshgrid(np.arange(Hd), np.arange(Wd),
+                                     indexing='ij')
+                valid = depth_map > 0
+                zz = depth_map[valid]
+                xx = (xg[valid] - cx_d) * zz / fx_d
+                yy = (yg[valid] - cy_d) * zz / fy_d
+                pts_cam = np.stack([xx, yy, zz], axis=-1)
+                R_cw = pose_c2w[:3, :3]
+                t_cw = pose_c2w[:3, 3]
+                pts_world = (R_cw @ pts_cam.T).T + t_cw
+                keep = remove_occluded_points(
+                    pts_world, intr, pose_c2w, depth_map.shape)
+                n_removed = (~keep).sum()
+                n_culled_total += n_removed
+                if n_removed > 0:
+                    valid_indices = np.where(valid.ravel())[0]
+                    occluded_indices = valid_indices[~keep]
+                    depth_flat = depth_map.ravel()
+                    depth_flat[occluded_indices] = 0
+                    np.save(dp, depth_flat.reshape(depth_map.shape)
+                            .astype(np.float32))
+            if n_culled_total > 0:
+                print(f"  Occlusion culling: removed {n_culled_total} points "
+                      f"across {len(depth_files_post)} frames")
+
+            # Surface depth to top level: output_dir/depth -> reconstruction/depth
+            top_depth = os.path.join(output_dir, "depth")
+            if not os.path.exists(top_depth):
+                os.symlink(os.path.join("reconstruction", "depth"), top_depth)
 
             elapsed = time.time() - t_start
             print(f"  Total: {elapsed:.1f}s")
@@ -509,8 +600,8 @@ def run_sam3d_batch(manifest, device, frame_interval, skip_scene_seg=False,
         try:
             # --- Metric rescaling ---
             if annotation_path and os.path.exists(annotation_path):
-                from rescale_to_metric import rescale_ttt3r_to_metric
-                rescale_ttt3r_to_metric(ttt3r_out, annotation_path,
+                from rescale_to_metric import rescale_to_metric_scale
+                rescale_to_metric_scale(ttt3r_out, annotation_path,
                                         results_dir=output_dir)
 
             # --- Step 3: SAM3D Object Detection + Reconstruction ---
@@ -799,18 +890,8 @@ def _prepare_for_training(manifest, manifest_path):
     print("Preparing outputs for training...")
     print(f"{'='*60}")
 
-    # 1. Depth symlinks
-    n_links = 0
-    for entry in manifest:
-        video_dir = entry["output_dir"]
-        link = os.path.join(video_dir, "depth")
-        target = os.path.join("intermediate_depth", "depth")
-        if not os.path.exists(link):
-            os.symlink(target, link)
-            n_links += 1
-    print(f"  Depth symlinks: {n_links} created")
-
-    # 2. Build filtered episode_frame_index
+    # Depth symlinks are now created during reconstruction (always).
+    # Build filtered episode_frame_index
     # Determine dataset and collect annotation basenames
     ann_basenames = set()
     dataset = None
@@ -862,7 +943,9 @@ def _prepare_for_training(manifest, manifest_path):
     new_eps = np.array([all_eps[i] for i in keep_idx])
 
     batch_name = os.path.basename(results_dir)
-    index_path = os.path.join(vitra3d_root, "Annotation", dataset,
+    index_dir = os.path.join(vitra3d_root, "Annotation", dataset)
+    os.makedirs(index_dir, exist_ok=True)
+    index_path = os.path.join(index_dir,
                               f"episode_frame_index_{batch_name}.npz")
     np.savez(index_path, index_frame_pair=new_pairs,
              index_to_episode_id=new_eps)
@@ -900,6 +983,8 @@ def main():
     parser.add_argument("--skip_sam3d", action="store_true")
     parser.add_argument("--skip_combine", action="store_true")
     parser.add_argument("--skip_visualizations", action="store_true")
+    parser.add_argument("--apply_scale", action="store_true",
+                        help="Apply metric scale to depth/camera files in-place")
     parser.add_argument("--intrinsics_root", type=str, default=None,
                         help="Root dir for intrinsics (ego4d/*.npy, egoexo4d/*.json)")
     parser.add_argument("--results_file", type=str, default=None,
@@ -909,7 +994,7 @@ def main():
     parser.add_argument("--num_gpus", type=int, default=1,
                         help="Number of GPUs to use. Splits manifest and launches "
                              "one worker per GPU as subprocesses.")
-    parser.add_argument("--make_training_ready", action="store_true",
+    parser.add_argument("--create_filtered_index", action="store_true",
                         help="After processing, create depth symlinks and build "
                              "filtered episode_frame_index for training.")
 
@@ -945,6 +1030,7 @@ def _run_single(args):
             manifest, args.device, args.frame_interval,
             pi3_ckpt=args.pi3_ckpt,
             intrinsics_root=args.intrinsics_root,
+            apply_scale=args.apply_scale,
         )
     else:
         results = run_sam3d_batch(
@@ -973,7 +1059,7 @@ def _run_single(args):
     print(f"Results saved to: {results_path}")
 
     # Post-processing: prepare outputs for training
-    if args.make_training_ready and args.mode == "pi3":
+    if args.create_filtered_index and args.mode == "pi3":
         _prepare_for_training(manifest, args.manifest)
 
 
@@ -1081,7 +1167,7 @@ def _run_multi_gpu(args):
     print(f"Merged results: {merged_path}")
 
     # Post-processing: prepare outputs for training
-    if args.make_training_ready and args.mode == "pi3":
+    if args.create_filtered_index and args.mode == "pi3":
         with open(args.manifest) as f:
             full_manifest = json.load(f)
         _prepare_for_training(full_manifest, args.manifest)

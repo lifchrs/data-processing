@@ -1,0 +1,19 @@
+{
+  "episodes": [
+    {
+      "annotation_path": "/home/ap977/GRILL/new_project/vitra_data/ego4d_other/episodic_annotations/Ego4D_0031d268-818c-4ec4-a804-935be610a61a_ep_000346.npy"
+    },
+    {
+      "annotation_path": "/home/ap977/GRILL/new_project/vitra_data/ego4d_other/episodic_annotations/Ego4D_007cb0df-4f4f-4810-b246-8ba6639f53e1_ep_000016.npy"
+    },
+    {
+      "annotation_path": "/home/ap977/GRILL/new_project/vitra_data/ego4d_other/episodic_annotations/Ego4D_00dec6a0-dd5f-4024-91cf-a4b7c92d1242_ep_000011.npy"
+    },
+    {
+      "annotation_path": "/home/ap977/GRILL/new_project/vitra_data/ego4d_other/episodic_annotations/Ego4D_01811fc3-9862-4b9a-ae33-1e5f86b28c15_ep_000129.npy"
+    },
+    {
+      "annotation_path": "/home/ap977/GRILL/new_project/vitra_data/ego4d_other/episodic_annotations/Ego4D_018b7ef7-2a81-4451-ab60-a638b5ee501b_ep_000344.npy"
+    }
+  ]
+}

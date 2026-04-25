@@ -84,12 +84,23 @@ def get_video_name_from_annotation(annotation_path):
 # Ego4D undistortion (omnidirectional → pinhole)
 # ---------------------------------------------------------------------------
 
-def undistort_ego4d(video_path, intrinsics_path, output_path):
+def undistort_ego4d(video_path, intrinsics_path, output_path,
+                    frame_range=None):
     """Undistort an Ego4D clip using omnidirectional intrinsics.
 
     The intrinsics .npy contains ``intrinsics_ori`` (K, D, xi) describing
     the original fisheye model and ``intrinsics_new`` (K) for the target
     pinhole model. When xi == 0 the video is already pinhole and we skip.
+
+    If ``frame_range=(start, end)`` is given, only process frames in
+    [start, end) (0-based, end-exclusive). Ego4D sources are multi-hour
+    full-scale videos, so restricting to the VITRA annotation range avoids
+    undistorting the entire video. Frame-accurate seeking is used via
+    ``cap.set(CAP_PROP_POS_FRAMES, start)``.
+
+    The output clip starts at the requested ``start`` frame — downstream
+    code must offset frame indices accordingly. This matches Epic clip
+    extraction.
     """
     intrinsics_info = np.load(intrinsics_path, allow_pickle=True).item()
     intrinsics_ori = intrinsics_info["intrinsics_ori"]
@@ -100,9 +111,9 @@ def undistort_ego4d(video_path, intrinsics_path, output_path):
     xi = np.array(intrinsics_ori["xi"]).astype(np.float32)
     new_K = intrinsics_new["K"].astype(np.float32)
 
-    if xi == 0:
-        print(f"  xi == 0 → already pinhole, skipping undistortion.")
-        return None  # signal: no undistortion needed
+    already_pinhole = (xi == 0)
+    if already_pinhole:
+        print(f"  xi == 0 → already pinhole; clipping to frame range without remap.")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -113,30 +124,46 @@ def undistort_ego4d(video_path, intrinsics_path, output_path):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Pre-compute remap tables (once)
-    map1, map2 = cv2.omnidir.initUndistortRectifyMap(
-        K, D, xi, np.eye(3), new_K, (width, height),
-        cv2.CV_16SC2, cv2.omnidir.RECTIFY_PERSPECTIVE,
-    )
+    if frame_range is not None:
+        start, end = frame_range
+        start = max(0, int(start))
+        end = min(total, int(end))
+        num_to_write = max(0, end - start)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    else:
+        if already_pinhole:
+            # Nothing to do — full pinhole video is fine as-is.
+            cap.release()
+            return None
+        start, num_to_write = 0, total
+
+    # Pre-compute remap tables (once) only if we actually need to undistort.
+    if not already_pinhole:
+        map1, map2 = cv2.omnidir.initUndistortRectifyMap(
+            K, D, xi, np.eye(3), new_K, (width, height),
+            cv2.CV_16SC2, cv2.omnidir.RECTIFY_PERSPECTIVE,
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    idx = 0
-    while True:
+    for idx in range(num_to_write):
         ret, frame = cap.read()
         if not ret:
             break
-        undistorted = cv2.remap(
-            frame, map1, map2,
-            interpolation=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
+        if already_pinhole:
+            undistorted = frame
+        else:
+            undistorted = cv2.remap(
+                frame, map1, map2,
+                interpolation=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
         writer.write(undistorted)
-        idx += 1
-        if idx % 100 == 0 or idx == total:
-            print(f"  Ego4D undistort: {idx}/{total} frames", end="\r")
+        if (idx + 1) % 100 == 0 or idx + 1 == num_to_write:
+            print(f"  Ego4D undistort: {idx + 1}/{num_to_write} frames "
+                  f"(source range {start}-{start + num_to_write})", end="\r")
 
     cap.release()
     writer.release()
@@ -225,7 +252,22 @@ def undistort_clip(video_path, annotation_path, output_path, intrinsics_root):
             print(f"WARNING: Intrinsics not found at {intrinsics_path}, skipping undistortion.",
                   file=sys.stderr)
             return video_path
-        result = undistort_ego4d(video_path, intrinsics_path, output_path)
+        # Ego4D source videos are multi-hour full-scale recordings; only
+        # undistort the VITRA annotation's frame range.  The output clip
+        # starts at vdf[0] — batch_worker derives the absolute frame offset
+        # from the raw vdf values so filenames stay absolute.
+        frame_range = None
+        try:
+            annot = np.load(annotation_path, allow_pickle=True).item()
+            vdf = annot.get("video_decode_frame")
+            if vdf is not None and len(vdf) > 0:
+                vdf = np.asarray(vdf)
+                frame_range = (int(vdf[0]), int(vdf[-1]) + 1)
+        except Exception as e:
+            print(f"  WARNING: Could not read vdf from {annotation_path}: {e}",
+                  file=sys.stderr)
+        result = undistort_ego4d(video_path, intrinsics_path, output_path,
+                                 frame_range=frame_range)
         return result if result is not None else video_path
 
     elif dataset == "egoexo4d":

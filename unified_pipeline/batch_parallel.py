@@ -113,6 +113,20 @@ def _resolve_ssv2_video(video_name, ssv2_video_dir):
     return None
 
 
+def _resolve_ego4d_video(video_name, ego4d_video_dir):
+    """Find an Ego4D video file by UUID.
+
+    Ego4D videos are UUID-named (e.g. ``{uuid}.mp4``) under ``full_scale/``.
+    ``video_name`` from ``_extract_video_name`` is already the bare UUID.
+    """
+    if not ego4d_video_dir:
+        return None
+    p = os.path.join(ego4d_video_dir, f"{video_name}.mp4")
+    if os.path.exists(p):
+        return p
+    return None
+
+
 def _resolve_epic_video(video_name, annotation, epic_video_dir, output_dir):
     """Find Epic-Kitchens source video and extract clip.
 
@@ -189,7 +203,7 @@ def _resolve_epic_video(video_name, annotation, epic_video_dir, output_dir):
 
 
 def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
-                     epic_video_dir=None, base_dir=None):
+                     epic_video_dir=None, ego4d_video_dir=None, base_dir=None):
     """Resolve input entries to full episodes with video paths.
 
     Each input entry needs at minimum 'annotation_path'. If 'video_path' is
@@ -213,6 +227,12 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
                 if os.path.isdir(default):
                     epic_video_dir = default
                 break
+
+    if ego4d_video_dir is None:
+        default = os.path.join(PROJECT_ROOT, "DATA", "ego4d_test",
+                               "v2", "full_scale")
+        if os.path.isdir(default):
+            ego4d_video_dir = default
 
     # First pass: resolve metadata and identify clips that need extraction
     episodes = []
@@ -248,6 +268,11 @@ def resolve_episodes(input_entries, output_dir, ssv2_video_dir=None,
             video_path = _resolve_ssv2_video(video_name, ssv2_video_dir)
             if video_path is None:
                 print(f"WARNING: SSv2 video not found for {video_name}, skipping")
+                continue
+        elif dataset == "ego4d":
+            video_path = _resolve_ego4d_video(video_name, ego4d_video_dir)
+            if video_path is None:
+                print(f"WARNING: Ego4D video not found for {video_name}, skipping")
                 continue
         elif dataset == "epic":
             # Defer clip extraction for parallel processing
@@ -373,11 +398,13 @@ def main():
         input_entries = input_data
         ssv2_video_dir = None
         epic_video_dir = None
+        ego4d_video_dir = None
         json_recon_method = None
     else:
         input_entries = input_data["episodes"]
         ssv2_video_dir = input_data.get("ssv2_video_dir")
         epic_video_dir = input_data.get("epic_video_dir")
+        ego4d_video_dir = input_data.get("ego4d_video_dir")
         json_recon_method = input_data.get("recon_method")
 
     # CLI flag overrides JSON; JSON overrides default
@@ -389,6 +416,8 @@ def main():
         ssv2_video_dir = os.path.join(input_dir, ssv2_video_dir)
     if epic_video_dir and not os.path.isabs(epic_video_dir):
         epic_video_dir = os.path.join(input_dir, epic_video_dir)
+    if ego4d_video_dir and not os.path.isabs(ego4d_video_dir):
+        ego4d_video_dir = os.path.join(input_dir, ego4d_video_dir)
 
     # Resolve episodes (auto-find videos, extract Epic clips)
     print("Resolving episodes...")
@@ -396,6 +425,7 @@ def main():
         input_entries, args.output_dir,
         ssv2_video_dir=ssv2_video_dir,
         epic_video_dir=epic_video_dir,
+        ego4d_video_dir=ego4d_video_dir,
         base_dir=input_dir,
     )
 

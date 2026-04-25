@@ -138,17 +138,27 @@ def _extract_color_frames(video_path, recon_dir, depth_basenames,
 
     frame_set = set(int(bn) for bn in depth_basenames)
 
+    # Prefer the per-episode undistorted clip when it exists (Ego4D / EgoExo4D).
+    # The undistorted clip was produced from exactly the vdf range so its
+    # frame 0 corresponds to source frame vdf[0].
+    undistorted_path = os.path.join(os.path.dirname(recon_dir),
+                                    "undistorted_video.mp4")
+    if os.path.exists(undistorted_path):
+        video_path = undistorted_path
+
     # Determine if we need a frame offset (source video vs clip)
     frame_offset = 0
     if annotation_path and os.path.exists(annotation_path):
         ann = np.load(annotation_path, allow_pickle=True).item()
         vdf = ann.get("video_decode_frame")
         if vdf is not None and len(vdf) > 0:
-            # Check if depth basenames are clip-relative (start near 0)
-            # vs absolute (start at vdf[0])
             min_depth_frame = min(frame_set)
-            if min_depth_frame < vdf[0]:
-                # Depth frames are clip-relative, video is source
+            if video_path == undistorted_path:
+                # Depth basenames are absolute source-video frame indices,
+                # but the clip starts at vdf[0] → subtract vdf[0] to index in.
+                frame_offset = -int(vdf[0])
+            elif min_depth_frame < vdf[0]:
+                # Depth frames are clip-relative, video is source (Epic path)
                 frame_offset = int(vdf[0])
 
     cap = cv2.VideoCapture(video_path)

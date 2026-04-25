@@ -294,11 +294,33 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
     from pi3.utils.basic import load_images_as_tensor
     from pi3.models.pi3x import Pi3X
 
-    # Load Pi3 model
-    print(f"Loading Pi3X model...")
+    # Determine batch type from annotation prefixes.  Ego4D/EgoExo4D need
+    # known-K conditioning (multimodal Pi3X) because Pi3's unconditioned
+    # focal estimate is ~1.5× too high for wide-FOV ego cameras.  Epic/SSv2
+    # use Pi3's own intrinsics estimate (matches prior behavior).  Mixing
+    # the two types in one batch would force a single model setup that's
+    # wrong for half the entries — refuse.
+    ego_prefixes = ("Ego4D_", "EgoExo4D_")
+    other_prefixes = ("epic_kitchens_", "somethingsomethingv2_")
+    has_ego, has_other = False, False
+    for e in manifest:
+        bn = os.path.basename(e.get("annotation_path") or "")
+        if bn.startswith(ego_prefixes):
+            has_ego = True
+        elif bn.startswith(other_prefixes):
+            has_other = True
+    if has_ego and has_other:
+        raise ValueError(
+            "Mixed-dataset batch: this manifest contains both Ego4D/EgoExo4D "
+            "and Epic/SSv2 entries. Pi3 needs known-K conditioning for ego "
+            "data but should run unconditioned for Epic/SSv2 — split into "
+            "separate batches.")
+    needs_multimodal = has_ego
+
+    print(f"Loading Pi3X model (multimodal={needs_multimodal})...")
     t0 = time.time()
     if pi3_ckpt is not None:
-        model = Pi3X(use_multimodal=False).eval()
+        model = Pi3X(use_multimodal=needs_multimodal).eval()
         if pi3_ckpt.endswith('.safetensors'):
             from safetensors.torch import load_file
             weight = load_file(pi3_ckpt)
@@ -307,7 +329,8 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
         model.load_state_dict(weight, strict=False)
     else:
         model = Pi3X.from_pretrained("yyfz233/Pi3X").eval()
-        model.disable_multimodal()
+        if not needs_multimodal:
+            model.disable_multimodal()
     model = model.to(device)
     print(f"Pi3 model loaded in {time.time() - t0:.1f}s")
 
@@ -349,6 +372,13 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
             for d in [depth_dir, camera_dir]:
                 os.makedirs(d, exist_ok=True)
 
+            # Original video resolution — used to scale the annotation's K
+            # into Pi3's internal processing resolution.
+            _probe = cv2.VideoCapture(effective_video)
+            W_orig = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+            H_orig = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            _probe.release()
+
             # Load frames
             imgs = load_images_as_tensor(effective_video, interval=frame_interval).to(device)
             N, C, H, W = imgs.shape
@@ -381,18 +411,54 @@ def run_pi3_batch(manifest, device, frame_interval, pi3_ckpt=None,
                     print(f"  Clipping to VITRA range: frames {clip_start}-{clip_end} "
                           f"({N}/{n_before} frames)")
 
+            # Known-K conditioning — Ego4D / EgoExo4D only.
+            # Pi3's unconditioned focal estimate is accurate enough for
+            # Epic and SSv2 (typical handheld FOV) but undershoots for
+            # wide-FOV ego cameras (~87° vfov after undistortion), so we
+            # condition the model on the annotation's pinhole K for those
+            # datasets only.  Avoids changing behavior on Epic/SSv2.
+            K_known_pi3 = None
+            ep_basename = os.path.basename(annotation_path or "")
+            is_ego = ep_basename.startswith(("Ego4D_", "EgoExo4D_"))
+            if is_ego and annotation_path and os.path.exists(annotation_path):
+                try:
+                    _ann = np.load(annotation_path, allow_pickle=True).item()
+                    K_ann = _ann.get("intrinsics")
+                    if K_ann is not None and W_orig > 0 and H_orig > 0:
+                        K_ann = np.asarray(K_ann, dtype=np.float32)
+                        sx = float(W) / float(W_orig)
+                        sy = float(H) / float(H_orig)
+                        K_known_pi3 = K_ann.copy()
+                        K_known_pi3[0, 0] *= sx
+                        K_known_pi3[0, 2] *= sx
+                        K_known_pi3[1, 1] *= sy
+                        K_known_pi3[1, 2] *= sy
+                        print(f"  Using known K: fx={K_known_pi3[0,0]:.1f} "
+                              f"fy={K_known_pi3[1,1]:.1f} at ({H}, {W})")
+                except Exception as e:
+                    print(f"  WARNING: couldn't load known K: {e}")
+
             # Run Pi3 inference
             with torch.no_grad():
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    res = model(imgs[None])
+                    if K_known_pi3 is not None:
+                        K_tensor = torch.from_numpy(K_known_pi3).to(device)
+                        K_tensor = K_tensor[None, None].expand(1, N, 3, 3)
+                        res = model(imgs[None], intrinsics=K_tensor)
+                    else:
+                        res = model(imgs[None])
 
             local_points = res['local_points'][0].cpu().numpy()
             camera_poses = res['camera_poses'][0].cpu().numpy()
             conf = res['conf'][0].cpu().numpy()
 
-            # Derive intrinsics
-            from run_pi3 import derive_intrinsics
-            K = derive_intrinsics(local_points, conf)
+            # Intrinsics: prefer the known K we conditioned on; fall back
+            # to deriving from local_points when no annotation K available.
+            if K_known_pi3 is not None:
+                K = K_known_pi3.astype(np.float64)
+            else:
+                from run_pi3 import derive_intrinsics
+                K = derive_intrinsics(local_points, conf)
 
             # Save per-frame outputs
             frame_nums = []
